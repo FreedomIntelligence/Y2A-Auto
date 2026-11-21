@@ -12,6 +12,8 @@
 
 从下载、ASR、字幕翻译、字幕质检、内容审核到上传，全流程自动化；内置 Web 管理后台、YouTube 监控和维护能力。
 
+> **FreedomIntelligence 分支**：fork 自 [fqscfqj/Y2A-Auto](https://github.com/fqscfqj/Y2A-Auto)，在无人值守向 bilibili 搬运的场景下补了几处：多语种标题翻译、只有导流内容的简介留空、监控跳过纯话题标签标题、投稿最小间隔、限流与网络失败自动重试、投稿账号校验。相关配置见[账号与网络](#账号与网络)和[AI 与投稿](#ai-与投稿)。
+
 [快速开始](#快速开始) · [功能概览](#功能概览) · [部署与运行](#部署与运行) · [Telegram 机器人](#方案-dtelegram-转发机器人可选) · [配置说明](#配置说明) · [使用指南](#使用指南) · [通知推送](#通知推送) · [CookieCloud](#cookiecloud-集成) · [安全特性](#安全特性) · [常见问题](#常见问题)
 
 ---
@@ -245,6 +247,8 @@ python app.py
 - `ACFUN_COOKIES_PATH`：AcFun Cookie 路径
 - `BILIBILI_COOKIES_PATH`：bilibili Cookie 路径
 - `BILIBILI_SUBMIT_API`：bilibili 投稿接口，`auto`（默认，优先必剪 PC 接口，失败回退 Web）/ `bcut_pc` / `web`（手改成 `bcut` 等别名也会被归一化后再保存）
+- `BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES`：两次 bilibili 投稿之间的最小间隔（分钟），默认 `30`，`0` 不限制。同一账号几分钟内连续投稿会被 B 站以 137022「投稿过于频繁」拒绝；不足间隔时上传前自动等待，任务进度显示「等待B站投稿间隔」
+- `BILIBILI_EXPECTED_UID`：期望的 bilibili 账号 UID（个人空间地址 `space.bilibili.com/` 后面的数字），默认留空不校验。填写后每次上传前核对 Cookie 里登录的账号，扫码登成别的账号时拒绝上传
 - `YOUTUBE_PROXY_ENABLED` / `YOUTUBE_PROXY_URL`：YouTube 下载代理
 - `YOUTUBE_API_PROXY_ENABLED` / `YOUTUBE_API_PROXY_URL`：YouTube 监控 API 独立代理，不继承下载代理
 - `YOUTUBE_DOWNLOAD_THREADS`：下载线程数
@@ -270,7 +274,9 @@ python app.py
 - `OPENAI_REASONING_EFFORT`：开启思考时的可选力度，支持 `auto` / `minimal` / `low` / `medium` / `high` / `xhigh`，默认 `auto`。字幕翻译、质检、智能分段可分别使用 `SUBTITLE_OPENAI_REASONING_EFFORT`、`SUBTITLE_QC_REASONING_EFFORT`、`AI_SEGMENTATION_REASONING_EFFORT` 独立设置，默认也为 `auto`（模型默认，不继承全局力度）。关闭对应思考开关时不会因选择高力度而重新启用思考。各模型支持的力度不同，明确拒绝的参数会降级处理并记录 warning。
 - `SUBTITLE_OPENAI_*`：字幕翻译专用覆盖配置，留空则回退全局
 - `SUBTITLE_QC_*`：字幕质检专用覆盖配置，留空则回退字幕翻译 / 全局配置
-- `TRANSLATE_TITLE` / `TRANSLATE_DESCRIPTION` / `GENERATE_TAGS`：自动生成标题、简介、标签
+- `TRANSLATE_TITLE` / `TRANSLATE_DESCRIPTION` / `GENERATE_TAGS`：自动生成标题、简介、标签。标题和简介支持任意文字系统的原文（俄语、印地语、马拉雅拉姆语、阿拉伯语等）；原简介只有链接、话题标签或联系方式时译文留空（投稿仍会附转载说明和来源），不再转入人工审核
+- `MONITOR_SKIP_UNTRANSLATABLE_TITLES`：监控跳过只有话题标签或表情的标题（如 `#dental #shorts`），默认 `true`，仅在开启 `TRANSLATE_TITLE` 时生效。这类标题没有可翻译的文字，加进来只会卡在人工审核
+- `UPLOAD_AUTO_RETRY_ENABLED` / `UPLOAD_AUTO_RETRY_MAX_ATTEMPTS`：上传失败自动重试，默认开启、最多 `3` 次。只针对 B 站限流（137022）和网络类错误（超时、连接中断、证书错误等）：限流依次在 60、120、240 分钟后重试，网络错误依次在 10、20、40 分钟后重试；登录失效、账号不匹配、406/603 风控等需要人处理的失败不会自动重试。任务列表里的失败原因会注明下一次重试时间，任何手动操作（重试、编辑后上传、放弃）都会取消已安排的自动重试
 - `RECOMMEND_PARTITION`：自动推荐分区
 - `FIXED_PARTITION_ID` / `FIXED_PARTITION_ID_BILIBILI`：固定分区
 - `YOUTUBE_UPLOADER_AS_FIRST_TAG`：将上传者作为首标签

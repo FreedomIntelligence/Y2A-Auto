@@ -12,6 +12,7 @@ import logging
 import shutil
 import threading
 import gc
+import math
 import shlex
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -106,6 +107,8 @@ DB_WRITE_RETRY_TIMES = 5
 DB_WRITE_RETRY_SLEEP_SECONDS = 0.2
 METADATA_TRANSLATION_ERROR_CATEGORY = 'metadata_translation_failed'
 CONTENT_MODERATION_ERROR_CATEGORY = 'content_moderation_failed'
+# 上传失败但已安排自动重试（B 站限流 137022 或网络类错误），见 _plan_upload_auto_retry
+UPLOAD_AUTO_RETRY_ERROR_CATEGORY = 'upload_auto_retry'
 
 # 字幕烧录超时估算参数（见 TaskManager._estimate_embed_timeout）。
 EMBED_TIMEOUT_MIN_SECONDS = 1800
@@ -735,9 +738,41 @@ def _get_missing_required_translation_fields(task, config) -> list:
 
     if _as_bool(config.get('TRANSLATE_DESCRIPTION', True)) and _normalize_task_text(task.get('description_original')):
         if not _normalize_task_text(task.get('description_translated')):
-            missing_fields.append('description')
+            # 原简介只有链接 / 话题标签 / 电话号码时没有可翻译的内容，译文本来就该为空
+            if _has_translatable_text(task.get('description_original'), 'description'):
+                missing_fields.append('description')
 
     return missing_fields
+
+
+def _has_translatable_text(text, content_type='description') -> bool:
+    """原文预清洗后是否还有可翻译的文字（与元数据翻译同一口径）。"""
+    try:
+        from modules.ai_enhancer import has_translatable_content
+    except Exception:
+        return bool(_normalize_task_text(text))
+    return has_translatable_content(text, content_type)
+
+
+def _resolve_upload_description(task, config) -> str:
+    """上传时使用的简介：优先译文；没有译文时回退原文。
+
+    开启了简介翻译、但原简介只有链接、话题标签或联系方式时，回退成空简介，
+    不把这些导流内容原样带到投稿里（转载说明和来源链接仍会照常追加）。
+    """
+    if not task:
+        return ''
+    translated = task.get('description_translated') or ''
+    if _normalize_task_text(translated):
+        return translated
+    original = task.get('description_original') or ''
+    if (
+        _normalize_task_text(original)
+        and _as_bool((config or {}).get('TRANSLATE_DESCRIPTION', True))
+        and not _has_translatable_text(original, 'description')
+    ):
+        return ''
+    return original
 
 
 def _build_missing_translation_review_message(field_names) -> str:
@@ -754,6 +789,201 @@ def _build_missing_translation_review_message(field_names) -> str:
     if not readable:
         return "自动翻译未完成，任务已转入人工审核。"
     return f"自动翻译未完成：{'、'.join(readable)}仍缺少有效译文，任务已转入人工审核。"
+
+
+# ---------------------------------------------------------------------------
+# bilibili 投稿节流与上传失败自动重试
+# ---------------------------------------------------------------------------
+# 同一账号短时间内连续投稿会被 B 站以 137022「投稿过于频繁」拒绝（低等级账号尤其明显）。
+# 监控一次加入多个任务时，它们会在几分钟内依次上传，第三个往往就被拒。
+
+UPLOAD_AUTO_RETRY_SCAN_SECONDS = 120
+# 自动重试的首次延后（分钟），之后每次翻倍
+_UPLOAD_RETRY_BASE_DELAY_MINUTES = {
+    'rate_limit': 60,
+    'network': 10,
+}
+_UPLOAD_RETRY_LABELS = {
+    'rate_limit': 'B站投稿限流',
+    'network': '网络异常',
+}
+_UPLOAD_RATE_LIMIT_MARKERS = ('137022', '投稿过于频繁')
+_UPLOAD_NETWORK_ERROR_PATTERNS = (
+    re.compile(r'curl: \((?:6|7|18|28|35|52|55|56|60)\)', re.IGNORECASE),
+    re.compile(r'operation timed out|read timeout|connect timeout|timed out', re.IGNORECASE),
+    re.compile(r'connection (?:reset|aborted|refused)|remote end closed|broken pipe', re.IGNORECASE),
+    re.compile(r'ssl certificate problem|certificate has expired', re.IGNORECASE),
+    re.compile(r'bad gateway|gateway time-?out|service unavailable|temporarily unavailable', re.IGNORECASE),
+)
+# 换个时间重试也不会好、需要人处理的失败
+_UPLOAD_NON_RETRYABLE_MARKERS = (
+    '账号不匹配', '登录态无效', 'Cookies', '参数不完整', '文件不存在', '分区ID',
+)
+_UPLOAD_NON_RETRYABLE_PATTERNS = (
+    # preupload 406（风控）和 603（账号级风控）要换网络环境或重新登录
+    re.compile(r'(?:返回|错误代码[：:]\s*|code=)(?:406|603)(?!\d)'),
+)
+
+
+def classify_retryable_upload_error(message):
+    """上传失败是否值得过一段时间自动重试：返回 'rate_limit'、'network' 或 None。"""
+    text = str(message or '')
+    if not text.strip():
+        return None
+    if any(marker in text for marker in _UPLOAD_NON_RETRYABLE_MARKERS):
+        return None
+    if any(pattern.search(text) for pattern in _UPLOAD_NON_RETRYABLE_PATTERNS):
+        return None
+    if any(marker in text for marker in _UPLOAD_RATE_LIMIT_MARKERS):
+        return 'rate_limit'
+    if any(pattern.search(text) for pattern in _UPLOAD_NETWORK_ERROR_PATTERNS):
+        return 'network'
+    return None
+
+
+def _plan_upload_auto_retry(task, error_message, config, now=None):
+    """为一次上传失败安排自动重试；不该重试或次数已用完时返回 None。
+
+    配置里没有 UPLOAD_AUTO_RETRY_ENABLED 时按关闭处理（load_config 会补齐默认值 True，
+    所以正式运行时默认开启；只传部分配置的调用方不会意外触发重试）。
+    """
+    config = config or {}
+    if not _as_bool(config.get('UPLOAD_AUTO_RETRY_ENABLED', False)):
+        return None
+    max_attempts = _as_int(config.get('UPLOAD_AUTO_RETRY_MAX_ATTEMPTS', 3), 3, minimum=0)
+    if max_attempts <= 0:
+        return None
+    kind = classify_retryable_upload_error(error_message)
+    if not kind:
+        return None
+    attempts_done = _as_int((task or {}).get('upload_retry_count'), 0, minimum=0)
+    if attempts_done >= max_attempts:
+        return None
+    delay_minutes = _UPLOAD_RETRY_BASE_DELAY_MINUTES[kind] * (2 ** attempts_done)
+    retry_at = (now or datetime.now()) + timedelta(minutes=delay_minutes)
+    return {
+        'kind': kind,
+        'label': _UPLOAD_RETRY_LABELS[kind],
+        'attempt': attempts_done + 1,
+        'max_attempts': max_attempts,
+        'delay_minutes': delay_minutes,
+        'retry_at': retry_at.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def _format_upload_retry_message(error_message, plan):
+    return (
+        f"{error_message}（{plan['label']}，{plan['delay_minutes']} 分钟后自动重试，"
+        f"第 {plan['attempt']}/{plan['max_attempts']} 次）"
+    )
+
+
+def _get_due_upload_retry_task_ids(now=None):
+    """已到计划时间、等待自动重试上传的失败任务 ID（按计划时间先后）。"""
+    now_text = (now or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            '''SELECT id FROM tasks
+               WHERE status = ? AND error_category = ?
+                 AND upload_retry_at IS NOT NULL AND upload_retry_at != '' AND upload_retry_at <= ?
+               ORDER BY upload_retry_at''',
+            (TASK_STATES['FAILED'], UPLOAD_AUTO_RETRY_ERROR_CATEGORY, now_text),
+        ).fetchall()
+        return [row['id'] for row in rows]
+    except Exception as e:
+        logger.warning(f"查询待自动重试的上传任务失败: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+_BILIBILI_SUBMIT_LOCK = threading.Lock()
+_LAST_BILIBILI_SUBMIT_AT = None
+_LAST_BILIBILI_SUBMIT_LOADED = False
+
+
+def _set_last_bilibili_submit_at(value):
+    """记录最近一次 bilibili 投稿时间（epoch 秒）；传 None 表示下次从数据库重新读取。"""
+    global _LAST_BILIBILI_SUBMIT_AT, _LAST_BILIBILI_SUBMIT_LOADED
+    with _BILIBILI_SUBMIT_LOCK:
+        _LAST_BILIBILI_SUBMIT_AT = value
+        _LAST_BILIBILI_SUBMIT_LOADED = value is not None
+
+
+def _load_last_bilibili_submit_at_from_db():
+    """进程重启后，用最近一次投稿成功的任务的更新时间作为上一次投稿时间。"""
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT MAX(updated_at) AS last_at FROM tasks "
+            "WHERE bilibili_upload_response IS NOT NULL AND bilibili_upload_response != ''"
+        ).fetchone()
+        value = row['last_at'] if row else None
+        if not value:
+            return None
+        return datetime.strptime(str(value)[:19], '%Y-%m-%d %H:%M:%S').timestamp()
+    except Exception as e:
+        logger.debug(f"读取最近一次 bilibili 投稿时间失败: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _get_last_bilibili_submit_at():
+    global _LAST_BILIBILI_SUBMIT_AT, _LAST_BILIBILI_SUBMIT_LOADED
+    with _BILIBILI_SUBMIT_LOCK:
+        if not _LAST_BILIBILI_SUBMIT_LOADED:
+            _LAST_BILIBILI_SUBMIT_AT = _load_last_bilibili_submit_at_from_db()
+            _LAST_BILIBILI_SUBMIT_LOADED = True
+        return _LAST_BILIBILI_SUBMIT_AT
+
+
+def _bilibili_upload_wait_seconds(last_submit_at, now, interval_seconds):
+    """距离允许下一次投稿还需等待的秒数。"""
+    if not last_submit_at or interval_seconds <= 0:
+        return 0
+    return max(0, int(math.ceil(last_submit_at + interval_seconds - now)))
+
+
+def _wait_for_bilibili_upload_slot(task_id, task_logger, config, *, clock=None, wait=None):
+    """距上一次 bilibili 投稿不足最小间隔时等待；等待期间任务被取消则返回 False。
+
+    调用方持有上传信号量，所以多个待上传任务会依次排队、彼此间隔开。等待时每分钟
+    刷新一次上传进度：界面上能看到原因，卡住任务扫描也不会把它当成卡死。
+
+    配置里没有这个键时不等待（load_config 会补齐默认值 30，所以正式运行时默认开启）。
+    """
+    interval_minutes = _as_int(
+        (config or {}).get('BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES', 0), 0, minimum=0)
+    interval_seconds = interval_minutes * 60
+    if interval_seconds <= 0:
+        return True
+    clock = clock or time.time
+    if wait is None:
+        cancel_event = get_task_cancel_event(task_id)
+        if cancel_event is not None:
+            wait = cancel_event.wait
+        else:
+            def wait(timeout):
+                time.sleep(timeout)
+                return False
+    announced = False
+    while True:
+        remaining = _bilibili_upload_wait_seconds(_get_last_bilibili_submit_at(), clock(), interval_seconds)
+        if remaining <= 0:
+            return True
+        minutes_left = max(1, int(math.ceil(remaining / 60)))
+        if not announced:
+            task_logger.info(
+                f"距上一次 bilibili 投稿不足 {interval_minutes} 分钟，约 {minutes_left} 分钟后再上传"
+                "（避免 137022 投稿过于频繁）"
+            )
+            announced = True
+        update_task(task_id, upload_progress=f"等待B站投稿间隔，约 {minutes_left} 分钟后上传", silent=True)
+        if wait(min(60, remaining)):
+            task_logger.info("等待投稿间隔时收到取消请求，停止上传")
+            return False
 
 
 #: ``_run_subtitle_qc`` 的返回值之一：用户**主动关闭**了字幕质检。
@@ -1413,7 +1643,9 @@ def init_db():
         bilibili_upload_response TEXT,
         asr_warning_message TEXT,  -- ASR/VAD阶段的非致命警告（如vad_low_coverage），不影响上传流程
         subtitle_warning_message TEXT,  -- 字幕处理阶段的非致命警告（如烧录失败），不影响上传流程
-        subtitle_quality_state TEXT  -- ASR质量结局（ok/degraded/failed），failed时禁止烧录字幕
+        subtitle_quality_state TEXT,  -- ASR质量结局（ok/degraded/failed），failed时禁止烧录字幕
+        upload_retry_count INTEGER DEFAULT 0,  -- 上传失败后已安排的自动重试次数
+        upload_retry_at TEXT  -- 下一次自动重试上传的时间（本地时间 YYYY-MM-DD HH:MM:SS），NULL 表示没有安排
     )
     ''')
     
@@ -1648,6 +1880,17 @@ def init_db():
             logger.info("数据库升级：添加subtitle_quality_state字段")
             conn.commit()
 
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'upload_retry_count' not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN upload_retry_count INTEGER DEFAULT 0")
+            logger.info("数据库升级：添加upload_retry_count字段")
+            conn.commit()
+        if 'upload_retry_at' not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN upload_retry_at TEXT")
+            logger.info("数据库升级：添加upload_retry_at字段")
+            conn.commit()
+
         # 数据迁移：将 error_message 中纯 ASR/VAD 警告 token 挪至 asr_warning_message，清空 error_message
         cursor.execute(
             "SELECT 1 FROM schema_migrations WHERE migration_key = ? LIMIT 1",
@@ -1807,6 +2050,11 @@ def update_task(task_id, silent=False, **kwargs):
     # 添加更新时间
     kwargs['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # 状态一旦变化（手动重试、重新处理、放弃、成功……），之前安排的自动重试上传就作废；
+    # 只有显式带上 upload_retry_at 的写入（安排重试本身）才保留计划。
+    if status_changed and 'upload_retry_at' not in kwargs:
+        kwargs['upload_retry_at'] = None
+
     # 白名单验证：只允许更新有效的列名
     ALLOWED_COLUMNS = {
         'youtube_url': 'youtube_url = ?',
@@ -1845,6 +2093,8 @@ def update_task(task_id, silent=False, **kwargs):
         'asr_warning_message': 'asr_warning_message = ?',
         'subtitle_warning_message': 'subtitle_warning_message = ?',
         'subtitle_quality_state': 'subtitle_quality_state = ?',
+        'upload_retry_count': 'upload_retry_count = ?',
+        'upload_retry_at': 'upload_retry_at = ?',
     }
 
     # 过滤掉不在白名单中的列
@@ -2197,13 +2447,17 @@ def _is_upload_stage_failure(task, config=None):
     return PIPELINE_STAGE_DOWNLOAD_VIDEO in completed and PIPELINE_STAGE_TRANSLATE_SUBTITLE in completed
 
 
-def _start_background_upload_retry(task_id, config):
-    """后台重试上传，避免批量重试请求阻塞 Web 响应。"""
+def _start_background_upload_retry(task_id, config, allow_missing_translations=True):
+    """后台重试上传，避免批量重试请求阻塞 Web 响应。
+
+    ``allow_missing_translations=False`` 用于自动重试：按正常上传路径校验译文和审核结果，
+    不像手动「重试失败任务」那样走强制上传。
+    """
     import threading
 
     def run_upload_retry():
         try:
-            force_upload_task(task_id, config)
+            force_upload_task(task_id, config, allow_missing_translations=allow_missing_translations)
         except Exception as exc:
             logger.error(f"后台上传重试任务 {task_id} 出错: {exc}")
 
@@ -2628,6 +2882,49 @@ class TaskProcessor:
             logger.info(f"已启动卡住任务扫描：每 {stuck_check_interval} 秒")
         except Exception as e:
             logger.warning(f"注册卡住任务扫描失败（不影响主流程）：{e}")
+
+        try:
+            self.scheduler.add_job(
+                self._run_due_upload_retries,
+                'interval',
+                seconds=UPLOAD_AUTO_RETRY_SCAN_SECONDS,
+                id='upload_auto_retry',
+                replace_existing=True
+            )
+            logger.info(f"已启动上传失败自动重试扫描：每 {UPLOAD_AUTO_RETRY_SCAN_SECONDS} 秒")
+        except Exception as e:
+            logger.warning(f"注册上传自动重试扫描失败（不影响主流程）：{e}")
+
+    def _run_due_upload_retries(self):
+        """把到点的「上传失败自动重试」任务重新送去上传（只走上传阶段，不重跑流水线）。"""
+        try:
+            if not _as_bool(self.config.get('UPLOAD_AUTO_RETRY_ENABLED', False)):
+                return
+            for task_id in _get_due_upload_retry_task_ids():
+                if _is_task_active(task_id):
+                    continue
+                task = get_task(task_id)
+                if not task or task.get('status') != TASK_STATES['FAILED']:
+                    continue
+                if not _is_upload_stage_failure(task, self.config):
+                    logger.warning(f"任务 {task_id[:8]}... 的本地视频已不在，取消自动重试，需要手动重试")
+                    update_task(task_id, silent=True, upload_retry_at=None, error_category=None)
+                    continue
+                logger.info(
+                    f"自动重试上传：任务 {task_id[:8]}...（第 {task.get('upload_retry_count') or 1} 次）"
+                )
+                if not update_task(
+                    task_id,
+                    silent=True,
+                    status=TASK_STATES['READY_FOR_UPLOAD'],
+                    error_message=None,
+                    error_category=None,
+                    upload_progress=None,
+                ):
+                    continue
+                _start_background_upload_retry(task_id, self.config, allow_missing_translations=False)
+        except Exception as e:
+            logger.warning(f"上传自动重试扫描失败（忽略）：{e}")
 
     def _refresh_runtime_limits(self, force=False):
         """按当前配置刷新并发上限；运行中有活动任务时延后生效。"""
@@ -3523,6 +3820,9 @@ class TaskProcessor:
             updates['video_title_translated'] = translated.get('title', '')
         if translate_description and 'description' in requested_fields:
             updates['description_translated'] = translated.get('description', '')
+        elif translate_description and 'description' in (translated.get('skipped_fields') or []):
+            # 原简介没有可翻译的内容（只有链接、话题标签、联系方式），译文留空
+            updates['description_translated'] = ''
 
         if translated.get('success'):
             if updates:
@@ -9464,7 +9764,7 @@ class TaskProcessor:
         video_path = task.get('video_path_local', '') if task else ''
         cover_path = task.get('cover_path_local', '') if task else ''
         title = (task.get('video_title_translated', '') or task.get('video_title_original', '')) if task else ''
-        description = (task.get('description_translated', '') or task.get('description_original', '')) if task else ''
+        description = _resolve_upload_description(task, self.config) if task else ''
         partition_id = _get_task_partition_id(task, UPLOAD_TARGET_ACFUN, prefer_selected=True) if task else ''
         missing_translation_fields = _get_missing_required_translation_fields(task, self.config)
         if missing_translation_fields:
@@ -9708,7 +10008,7 @@ class TaskProcessor:
         video_path = task.get('video_path_local', '') if task else ''
         cover_path = task.get('cover_path_local', '') if task else ''
         title = (task.get('video_title_translated', '') or task.get('video_title_original', '')) if task else ''
-        description = (task.get('description_translated', '') or task.get('description_original', '')) if task else ''
+        description = _resolve_upload_description(task, self.config) if task else ''
         upload_target = _get_task_upload_target(task)
         effective_limits = _get_effective_metadata_limits(upload_target)
         partition_id = ''
@@ -9879,11 +10179,29 @@ class TaskProcessor:
             )
             return
 
+        # 与上一次投稿保持最小间隔，避免 137022「投稿过于频繁」
+        if not _wait_for_bilibili_upload_slot(task_id, task_logger, self.config):
+            current_task = get_task(task_id) or {}
+            if current_task.get('status') != TASK_STATES['FAILED']:
+                update_task(
+                    task_id,
+                    status=TASK_STATES['FAILED'],
+                    error_message="等待B站投稿间隔时任务被取消",
+                    upload_progress=None
+                )
+            return
+        update_task(task_id, upload_progress='0.0%', silent=True)
+
+        upload_attempted = False
         try:
-            uploader = BilibiliUploader(
-                cookie_file=bilibili_cookies_path,
-                submit_api=self.config.get('BILIBILI_SUBMIT_API', 'auto'),
-            )
+            uploader_kwargs = {
+                'cookie_file': bilibili_cookies_path,
+                'submit_api': self.config.get('BILIBILI_SUBMIT_API', 'auto'),
+            }
+            expected_uid = str(self.config.get('BILIBILI_EXPECTED_UID', '') or '').strip()
+            if expected_uid:
+                uploader_kwargs['expected_uid'] = expected_uid
+            uploader = BilibiliUploader(**uploader_kwargs)
             last_progress_text = '0.0%'
 
             def _normalize_progress_text(progress_text):
@@ -9915,6 +10233,7 @@ class TaskProcessor:
                 last_progress_text = normalized_text
                 update_task(task_id, upload_progress=normalized_text, silent=True)
 
+            upload_attempted = True
             success, result = uploader.upload_video(
                 video_file_path=video_path,
                 cover_file_path=cover_path,
@@ -9928,6 +10247,8 @@ class TaskProcessor:
                 title_limit=effective_limits['title_limit'],
                 description_limit=effective_limits['description_limit'],
             )
+            # 无论成败都算一次投稿尝试，下一次投稿从这里开始计间隔
+            _set_last_bilibili_submit_at(time.time())
 
             if success:
                 task_logger.info(f"bilibili上传成功: {result}")
@@ -9935,7 +10256,8 @@ class TaskProcessor:
                     task_id,
                     status=TASK_STATES['COMPLETED'],
                     bilibili_upload_response=json.dumps(result, ensure_ascii=False),
-                    upload_progress=None
+                    upload_progress=None,
+                    upload_retry_count=0,
                 )
                 # 上传到 B 站成功后立即删除本地文件，腾出磁盘空间，
                 # 避免大视频（如 CS2 比赛直播流，单条可达十余 GB）长期占用磁盘，
@@ -9956,22 +10278,42 @@ class TaskProcessor:
                     task_logger.warning(f"上传后删除本地文件失败（不影响已完成的 B 站上传）: {_e}")
             else:
                 task_logger.error(f"bilibili上传失败: {result}")
-                update_task(
-                    task_id,
-                    status=TASK_STATES['FAILED'],
-                    error_message=f"上传失败: {result}",
-                    upload_progress=None
-                )
+                self._record_bilibili_upload_failure(task_id, task_logger, f"上传失败: {result}")
         except Exception as e:
             task_logger.error(f"bilibili上传过程中发生异常: {str(e)}")
             import traceback
             task_logger.error(traceback.format_exc())
+            if upload_attempted:
+                _set_last_bilibili_submit_at(time.time())
+            self._record_bilibili_upload_failure(task_id, task_logger, f"上传异常: {str(e)}")
+
+    def _record_bilibili_upload_failure(self, task_id, task_logger, error_message):
+        """记录 bilibili 上传失败；限流和网络类错误顺带安排一次自动重试。"""
+        task = get_task(task_id) or {}
+        plan = _plan_upload_auto_retry(task, error_message, self.config)
+        if plan:
+            task_logger.warning(
+                f"{plan['label']}：已安排 {plan['delay_minutes']} 分钟后（{plan['retry_at']}）自动重试上传，"
+                f"第 {plan['attempt']}/{plan['max_attempts']} 次"
+            )
             update_task(
                 task_id,
                 status=TASK_STATES['FAILED'],
-                error_message=f"上传异常: {str(e)}",
-                upload_progress=None
+                error_message=_format_upload_retry_message(error_message, plan),
+                error_category=UPLOAD_AUTO_RETRY_ERROR_CATEGORY,
+                upload_retry_count=plan['attempt'],
+                upload_retry_at=plan['retry_at'],
+                upload_progress=None,
             )
+            return
+        updates = {
+            'status': TASK_STATES['FAILED'],
+            'error_message': error_message,
+            'upload_progress': None,
+        }
+        if task.get('error_category') == UPLOAD_AUTO_RETRY_ERROR_CATEGORY:
+            updates['error_category'] = None
+        update_task(task_id, **updates)
 
 # 任务控制函数
 def start_task(task_id, config=None):
@@ -10019,14 +10361,15 @@ def start_task(task_id, config=None):
     
     return job_id is not None
 
-def force_upload_task(task_id, config=None):
+def force_upload_task(task_id, config=None, allow_missing_translations=True):
     """
     强制上传任务
-    
+
     Args:
         task_id: 任务ID
         config: 配置信息
-    
+        allow_missing_translations: 缺译文时是否回退原文继续上传（自动重试传 False）
+
     Returns:
         success: 操作是否成功
     """
@@ -10061,7 +10404,8 @@ def force_upload_task(task_id, config=None):
     
     try:
         # 直接执行上传步骤
-        processor._upload_to_target(task_id, task_logger, allow_missing_translations=True)
+        processor._upload_to_target(
+            task_id, task_logger, allow_missing_translations=allow_missing_translations)
 
         # 上传流程（强制路径）不会进入 process_task 的 finally，需手动唤醒队列
         try:

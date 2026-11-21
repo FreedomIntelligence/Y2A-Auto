@@ -191,6 +191,16 @@ DEFAULT_CONFIG = {
     "BILIBILI_COOKIES_PATH": "cookies/bili_cookies.json", # bilibili Cookie 文件路径
     # bilibili 投稿通道：auto（优先必剪，失败回退 Web）/ bcut_pc / web
     "BILIBILI_SUBMIT_API": "auto",
+    # 两次 bilibili 投稿之间的最小间隔（分钟），0 表示不限制。连续投稿过快会被
+    # B 站以 137022「投稿过于频繁」拒绝；上传前不足间隔会自动等待。
+    "BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES": 30,
+    # 期望的 bilibili 账号 UID（可选）。填写后，登录账号与之不一致时拒绝上传，避免投错号。
+    "BILIBILI_EXPECTED_UID": "",
+    # 上传失败自动重试：只针对 B 站限流（137022）与网络类错误，按指数退避延后重试
+    "UPLOAD_AUTO_RETRY_ENABLED": True,
+    "UPLOAD_AUTO_RETRY_MAX_ATTEMPTS": 3,
+    # 监控跳过只有话题标签 / 表情、无法自动翻译的标题（仅在开启标题翻译时生效）
+    "MONITOR_SKIP_UNTRANSLATABLE_TITLES": True,
     # CookieCloud（首版仅用于手动拉取 YouTube Cookies）
     "COOKIECLOUD_ENABLED": False,
     "COOKIECLOUD_SERVER_URL": "",
@@ -709,6 +719,9 @@ def update_config(new_config):
                 # 别名一律归一化后再落盘，否则设置页三个 option 都匹配不上，
                 # 会出现"显示自动、实际走必剪"的回显错位。
                 current_config[key] = _normalize_submit_api_value(new_config[key])
+            elif key == 'BILIBILI_EXPECTED_UID':
+                # UID 只保留数字，避免带空格或「UID:」前缀时校验永远不通过
+                current_config[key] = ''.join(ch for ch in str(new_config[key] or '') if ch.isdigit())
             elif key == 'YOUTUBE_DOWNLOAD_QUALITY_MODE':
                 current_config[key] = normalize_youtube_download_quality_mode(new_config[key])
             elif key == 'YOUTUBE_DOWNLOAD_MAX_HEIGHT':

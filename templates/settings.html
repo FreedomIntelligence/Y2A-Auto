@@ -170,8 +170,13 @@
                                                         <input type="checkbox" name="RECOMMEND_PARTITION_WITH_COVER" {% if config.get('RECOMMEND_PARTITION_WITH_COVER', False) %}checked{% endif %}>
                                                         推荐分区时附带原视频封面供 AI 参考
                                                     </label>
+                                                    <label class="checkbox-label">
+                                                        <input type="checkbox" name="MONITOR_SKIP_UNTRANSLATABLE_TITLES" {% if config.get('MONITOR_SKIP_UNTRANSLATABLE_TITLES', True) %}checked{% endif %}>
+                                                        监控跳过只有话题标签或表情的标题
+                                                    </label>
                                                 </div>
                                                 <p class="help-text mt-2 mb-0">仅在已启用自动推荐分区、任务存在封面、且 AI 接口支持图片输入时生效；否则自动回退文本模式。</p>
+                                                <p class="help-text mt-1 mb-0">「跳过只有话题标签的标题」只在开启自动翻译标题时生效：这类标题（如 #dental #shorts）没有可翻译的文字，加进来只会卡在人工审核。</p>
                                             </div>
                                         </article>
                                     </div>
@@ -430,6 +435,16 @@
                                                         <option value="web" {% if config.get('BILIBILI_SUBMIT_API') == 'web' %}selected{% endif %}>仅 Web 投稿接口</option>
                                                     </select>
                                                     <p class="help-text">默认先用必剪 PC 投稿接口（与 Web 投稿风控相互独立），失败后自动回退 Web。</p>
+                                                </div>
+                                                <div class="form-group">
+                                                    <label for="bilibili-min-upload-interval" class="form-label">两次投稿最小间隔（分钟）</label>
+                                                    <input type="number" id="bilibili-min-upload-interval" name="BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES" value="{{ config.get('BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES', 30) }}" min="0" max="1440" class="form-control">
+                                                    <p class="help-text">连续投稿间隔太短会被 B 站以 137022「投稿过于频繁」拒绝。距上一次投稿不足这个间隔时，上传前会自动等待；填 0 不限制。</p>
+                                                </div>
+                                                <div class="form-group">
+                                                    <label for="bilibili-expected-uid" class="form-label">期望的 bilibili UID</label>
+                                                    <input type="text" id="bilibili-expected-uid" name="BILIBILI_EXPECTED_UID" value="{{ config.get('BILIBILI_EXPECTED_UID', '') }}" inputmode="numeric" pattern="[0-9]*" placeholder="留空则不校验" class="form-control">
+                                                    <p class="help-text">每次上传前核对当前登录的账号，扫码登成别的账号时拒绝上传，避免投错号。UID 是个人空间地址 space.bilibili.com/ 后面的数字。</p>
                                                 </div>
                                                 <div class="settings-inline-actions">
                                                     <button type="button" class="btn btn-outline-primary" id="bili-qrcode-start-btn">
@@ -2485,9 +2500,18 @@
                                                     <label for="max-concurrent-tasks" class="form-label">最大并发任务数</label>
                                                     <input type="number" id="max-concurrent-tasks" name="MAX_CONCURRENT_TASKS" value="{{ config.get('MAX_CONCURRENT_TASKS', 2) }}" min="1" max="10" class="form-control">
                                                 </div>
-                                                <div class="form-group mb-0">
+                                                <div class="form-group">
                                                     <label for="max-concurrent-uploads" class="form-label">最大并发上传数</label>
                                                     <input type="number" id="max-concurrent-uploads" name="MAX_CONCURRENT_UPLOADS" value="{{ config.get('MAX_CONCURRENT_UPLOADS', 1) }}" min="1" max="5" class="form-control">
+                                                </div>
+                                                <label class="checkbox-label mb-2">
+                                                    <input type="checkbox" name="UPLOAD_AUTO_RETRY_ENABLED" {% if config.get('UPLOAD_AUTO_RETRY_ENABLED', True) %}checked{% endif %}>
+                                                    上传失败后自动重试（只针对 B 站限流 137022 和网络超时、连接中断这类错误）
+                                                </label>
+                                                <div class="form-group mb-0">
+                                                    <label for="upload-auto-retry-max-attempts" class="form-label">自动重试次数上限</label>
+                                                    <input type="number" id="upload-auto-retry-max-attempts" name="UPLOAD_AUTO_RETRY_MAX_ATTEMPTS" value="{{ config.get('UPLOAD_AUTO_RETRY_MAX_ATTEMPTS', 3) }}" min="0" max="10" class="form-control">
+                                                    <p class="help-text">限流依次在 60、120、240 分钟后重试，网络错误依次在 10、20、40 分钟后重试；次数用完后任务保持失败，等人工处理。</p>
                                                 </div>
                                             </div>
                                         </article>
