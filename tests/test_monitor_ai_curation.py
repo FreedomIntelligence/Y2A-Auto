@@ -347,6 +347,25 @@ class MonitorNotificationTests(_MonitorTestBase):
         self.assertEqual([e.event_type for e in events], [EVENT_MONITOR_ALERT])
         self.assertIn("没有返回任何视频", events[0].payload["alert_reason"])
 
+    def test_everything_filtered_out_sends_alert(self):
+        """11-17、11-20 的情况：搜到视频，但全被过滤掉，当天没有新任务。"""
+        config_id = self._create_config(ai_filter_enabled=False, video_types="video,short")
+        live_replays = [_raw_video("a"), _raw_video("b")]
+        for video in live_replays:
+            video["liveStreamingDetails"] = {"actualEndTime": "2026-11-21T00:00:00Z"}
+        ok, _, events = self._run_capture(config_id, live_replays)
+        self.assertTrue(ok)
+        self.assertEqual([e.event_type for e in events], [EVENT_MONITOR_ALERT])
+        reason = events[0].payload["alert_reason"]
+        self.assertIn("本轮没有加入任何任务", reason)
+        self.assertIn("搜索 2 个，规则过滤后 0 个", reason)
+
+    def test_nothing_new_without_auto_add_is_not_an_alert(self):
+        config_id = self._create_config(auto_add_to_tasks=False)
+        ok, _, events = self._run_capture(config_id, [_raw_video("a")])
+        self.assertTrue(ok)
+        self.assertEqual([e.event_type for e in events], [EVENT_MONITOR_RUN_FINISHED])
+
     def test_zero_results_on_channel_monitor_is_not_an_alert(self):
         config_id = self._create_config(channel_ids="UCabc")
         ok, _, events = self._run_capture(config_id, [])

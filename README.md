@@ -550,7 +550,7 @@ group_add:
 - `qr_login_success`：QR 码登录成功
 - `qr_login_failed`：QR 码登录失败
 - `monitor_run_finished`：监控运行完成（`NOTIFY_EVENT_MONITOR_RUN_FINISHED`，默认关闭）：搜到多少、规则和 AI 选题后剩多少、加了哪些任务（带 AI 评分）、AI 淘汰了哪些
-- `monitor_alert`：监控异常（`NOTIFY_EVENT_MONITOR_ALERT`，默认开启）：运行失败、AI 选题失败、搜索 0 结果、配额跳过或抓取出错；这时只发异常，不再发运行摘要
+- `monitor_alert`：监控异常（`NOTIFY_EVENT_MONITOR_ALERT`，默认开启）：运行失败、AI 选题失败、配额跳过或抓取出错；关键词搜索监控 0 结果，或开了自动添加却一个任务都没加（例如搜到的全被过滤掉）。这时只发异常，不再发运行摘要；频道监控没有新视频不算异常
 
 通知采用异步重试队列（SQLite outbox），递增间隔（30s → 120s → 600s → 1800s → 3600s）保证最终投递。企业微信优先使用 Markdown 格式，失败后自动回退纯文本。
 

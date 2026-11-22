@@ -1352,9 +1352,19 @@ class YouTubeMonitor:
                 alert_reason = '今日 YouTube 搜索配额已用完，本轮跳过（太平洋时间零点重置）'
             elif getattr(self, '_last_fetch_had_errors', False):
                 alert_reason = '本轮抓取有错误，结果可能不完整'
+            # 下面两条只对关键词搜索报警：频道监控在频道没发新视频时 0 结果、0 新增是常态
             elif not stats.get('fetched_count') and not str(config.get('channel_ids') or '').strip():
-                # 只对关键词搜索报警：频道监控在频道没发新视频时 0 结果是常态
                 alert_reason = '搜索没有返回任何视频，请检查关键词、时间范围和内容类型设置'
+            elif (not str(config.get('channel_ids') or '').strip()
+                  and _as_bool(config.get('auto_add_to_tasks'))
+                  and not stats.get('added_count')):
+                # 2026-11-17、11-20 就是这种情况：搜到 40 个，全被类型过滤掉，当天没有投稿
+                ai_part = f"，AI 选题保留 {int(stats.get('ai_kept') or 0)} 个" if stats.get('ai_enabled') else ''
+                alert_reason = (
+                    f"本轮没有加入任何任务（搜索 {int(stats.get('fetched_count') or 0)} 个，"
+                    f"规则过滤后 {int(stats.get('filtered_count') or 0)} 个{ai_part}），"
+                    "连续出现时请检查筛选条件"
+                )
             event_type = EVENT_MONITOR_ALERT if alert_reason else EVENT_MONITOR_RUN_FINISHED
 
             from .notifications import is_notification_event_enabled
