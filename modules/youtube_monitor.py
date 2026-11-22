@@ -21,9 +21,70 @@ from urllib.parse import quote, urlsplit
 from apscheduler.schedulers.background import BackgroundScheduler
 from logging.handlers import RotatingFileHandler
 from modules.task_manager import add_task
-from .ai_enhancer import has_translatable_content
+from .ai_enhancer import has_enough_title_text
 from .config_manager import load_config
+from .monitor_curation import (
+    AI_CURATION_MAX_CANDIDATES,
+    AICurationError,
+    effective_criteria,
+    normalize_min_score,
+    rank_by_verdicts,
+    score_videos,
+    verdict_fingerprint,
+)
+from .notifications import (
+    EVENT_MONITOR_ALERT,
+    EVENT_MONITOR_RUN_FINISHED,
+    NotificationEvent,
+    emit_notification_event,
+)
 from .utils import get_app_subdir
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or '').strip().lower() in ('true', '1', 'on', 'yes')
+
+
+_SCHEDULE_TIME_RE = re.compile(r'^\s*([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)\s*$')
+
+
+def parse_schedule_time(value: Any) -> Optional[Tuple[int, int]]:
+    """解析监控的「对齐时刻」HH:MM（服务器本地时区）；空值或非法值返回 None。"""
+    match = _SCHEDULE_TIME_RE.match(str(value or ''))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def normalize_schedule_time(value: Any) -> str:
+    parsed = parse_schedule_time(value)
+    return f"{parsed[0]:02d}:{parsed[1]:02d}" if parsed else ''
+
+
+def schedule_anchor(hour: int, minute: int, now: Optional[datetime] = None) -> datetime:
+    """间隔调度的起点：今天的 HH:MM。之后每隔 interval 触发一次，与何时保存或重启无关。"""
+    current = now or datetime.now()
+    return current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def missed_scheduled_run(last_run_time: Any, interval_minutes: int, now_utc: Optional[datetime] = None) -> bool:
+    """对齐调度在重启后是否需要补跑：从未运行，或距上次运行已超过一个间隔（含 5 分钟余量）。
+
+    last_run_time 是 SQLite CURRENT_TIMESTAMP（UTC，'YYYY-MM-DD HH:MM:SS'）。
+    """
+    text = str(last_run_time or '').strip()
+    if not text:
+        return True
+    try:
+        last = datetime.strptime(text[:19], '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return True
+    now_value = now_utc or datetime.now(timezone.utc).replace(tzinfo=None)
+    return now_value - last > timedelta(minutes=max(1, int(interval_minutes)) + 5)
 
 
 def should_skip_untranslatable_titles(app_config: Optional[Dict[str, Any]]) -> bool:
@@ -136,7 +197,18 @@ MONITOR_CONFIG_FIELD_DEFAULTS: Dict[str, Any] = {
     'historical_progress_date': '',
     'historical_offset': 0,
     'video_types': 'video,short,live',
+    # AI 选题：规则过滤之后让模型按选题标准打分，只保留达到门槛的并按分数排序
+    'ai_filter_enabled': False,
+    'ai_filter_criteria': '',
+    'ai_filter_min_score': 6,
+    # 自动调度的对齐时刻 HH:MM（服务器本地时区）；留空则从保存/启动时刻起算间隔
+    'schedule_time': '',
 }
+
+# 更新配置时调用方漏传这些字段就沿用旧值，避免静默关掉 AI 选题或清空对齐时刻
+_MONITOR_FIELDS_KEPT_WHEN_OMITTED = (
+    'ai_filter_enabled', 'ai_filter_criteria', 'ai_filter_min_score', 'schedule_time',
+)
 
 MONITOR_CONFIG_DB_FIELDS: Tuple[str, ...] = tuple(MONITOR_CONFIG_FIELD_DEFAULTS.keys())
 
@@ -278,6 +350,18 @@ class YouTubeMonitor:
             except sqlite3.OperationalError:
                 pass
             
+            # AI 选题与调度对齐时刻
+            for column_sql in (
+                "ai_filter_enabled BOOLEAN DEFAULT 0",
+                "ai_filter_criteria TEXT DEFAULT ''",
+                "ai_filter_min_score INTEGER DEFAULT 6",
+                "schedule_time TEXT DEFAULT ''",
+            ):
+                try:
+                    cursor.execute(f"ALTER TABLE monitor_configs ADD COLUMN {column_sql}")
+                except sqlite3.OperationalError:
+                    pass
+
             # 添加历史搬运进度记录字段
             try:
                 cursor.execute("ALTER TABLE monitor_configs ADD COLUMN historical_progress_date TEXT DEFAULT ''")
@@ -321,6 +405,27 @@ class YouTubeMonitor:
                 cursor.execute("ALTER TABLE monitor_history ADD COLUMN task_claimed_at REAL DEFAULT NULL")
             except sqlite3.OperationalError:
                 pass
+
+            # AI 选题给这条视频的评分和理由（未启用 AI 选题时为空），显示在监控历史里
+            for column_sql in ("ai_score INTEGER DEFAULT NULL", "ai_reason TEXT DEFAULT NULL"):
+                try:
+                    cursor.execute(f"ALTER TABLE monitor_history ADD COLUMN {column_sql}")
+                except sqlite3.OperationalError:
+                    pass
+
+            # AI 选题评分缓存：被淘汰的候选不写进监控历史（和其它过滤条件一样，下轮仍是候选），
+            # 靠这张表避免每轮重复打分。fingerprint 随选题标准、关键词、模型变化，变了就重新打分。
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS monitor_ai_verdicts (
+                    config_id INTEGER NOT NULL,
+                    video_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    reason TEXT,
+                    scored_at REAL NOT NULL,
+                    PRIMARY KEY (config_id, video_id, fingerprint)
+                )
+            ''')
 
             # 历史记录按配置和视频唯一：先清理旧版本可能产生的重复行，再建立唯一索引。
             # 这一步对已有数据库幂等，重复历史仅保留最早的一条记录。
@@ -849,6 +954,10 @@ class YouTubeMonitor:
                     'title_keywords': (old_config or {}).get('title_keywords') or '',
                     'title_match_mode': (old_config or {}).get('title_match_mode') or 'any',
                 }
+                for kept_field in _MONITOR_FIELDS_KEPT_WHEN_OMITTED:
+                    old_value = (old_config or {}).get(kept_field)
+                    if old_value is not None:
+                        update_field_defaults[kept_field] = old_value
                 self._update_monitor_config_record(cursor, config_id, config_data, update_field_defaults)
                 
                 conn.commit()
@@ -911,6 +1020,7 @@ class YouTubeMonitor:
                 cursor.execute('DELETE FROM monitor_configs WHERE id = ?', (config_id,))
                 cursor.execute('DELETE FROM monitor_history WHERE config_id = ?', (config_id,))
                 cursor.execute('DELETE FROM monitor_run_claim WHERE config_id = ?', (config_id,))
+                cursor.execute('DELETE FROM monitor_ai_verdicts WHERE config_id = ?', (config_id,))
                 conn.commit()
                 
                 logger.info(f"监控配置已删除: {config_name} (ID: {config_id}), 同时删除了 {history_count} 条历史记录")
@@ -997,6 +1107,8 @@ class YouTubeMonitor:
         logger.info(f"监控类型: {config.get('monitor_type', 'youtube_search')}, "
                    f"频道模式: {config.get('channel_mode', 'latest')}")
         
+        # 本轮统计，运行结束后用于「监控运行完成 / 监控异常」通知
+        run_stats: Dict[str, Any] = {'fetched_count': 0, 'filtered_count': 0, 'added_videos': []}
         try:
             # 获取视频
             logger.info("开始获取视频数据...")
@@ -1004,13 +1116,15 @@ class YouTubeMonitor:
             self._last_fetch_had_errors = False
             self._last_fetch_quota_skipped = False
             videos = self._fetch_trending_videos(config)
+            run_stats['fetched_count'] = len(videos)
             logger.info(f"获取到 {len(videos)} 个视频")
-            
+
             # 筛选视频
             logger.info("开始筛选视频...")
             filtered_videos = self._filter_videos(videos, config)
+            run_stats['filtered_count'] = len(filtered_videos)
             logger.info(f"筛选后剩余 {len(filtered_videos)} 个视频")
-            
+
             # 历史搬运模式需要考虑偏移量
             if config.get('channel_mode') == 'historical':
                 current_offset = config.get('historical_offset', 0)
@@ -1018,7 +1132,28 @@ class YouTubeMonitor:
                     logger.info(f"历史搬运模式，跳过前 {current_offset} 个视频")
                     filtered_videos = filtered_videos[current_offset:]
                     logger.info(f"应用偏移量后剩余 {len(filtered_videos)} 个视频")
-            
+
+            # AI 选题：只把达到门槛的新候选按分数从高到低交给下面的入队循环
+            ai_note = ''
+            if _as_bool(config.get('ai_filter_enabled')):
+                run_stats['ai_enabled'] = True
+                try:
+                    filtered_videos, ai_summary = self._apply_ai_curation(config, config_id, filtered_videos)
+                except AICurationError as exc:
+                    # 宁可这一轮不加任务，也不把没经过 AI 选题的候选放进队列。
+                    # 不更新 last_run_time，下次运行重新打分。
+                    self._last_fetch_had_errors = True
+                    run_stats['ai_error'] = str(exc)
+                    logger.error(f"AI 选题失败，本轮不添加任务: {exc}")
+                    message = f"监控失败：AI 选题失败（{exc}），本轮未添加任务，下次运行会重试"
+                    self._notify_monitor_run(config, run_stats, success=False, message=message)
+                    return False, message
+                run_stats.update(ai_summary)
+                ai_note = (
+                    f"；AI 选题：{ai_summary['ai_kept']}/{ai_summary['ai_candidates']} 个新候选"
+                    f"达到 {ai_summary['ai_min_score']} 分"
+                )
+
             # 保存到历史记录
             added_count = 0
             processed_count = 0
@@ -1051,6 +1186,12 @@ class YouTubeMonitor:
                 task_added = bool(self._video_history_task_status(video['id'], config_id))
                 if should_add_to_tasks and task_added:
                     added_count += 1
+                    run_stats['added_videos'].append({
+                        'id': video['id'],
+                        'title': video.get('title', ''),
+                        'ai_score': video.get('ai_score'),
+                        'ai_reason': video.get('ai_reason', ''),
+                    })
                     logger.info(f"视频已添加到任务队列 ({added_count}/{max_add_to_tasks}): {video['title']}")
                 elif should_add_to_tasks:
                     logger.warning(f"视频已保存但添加任务失败，可在后续运行重试: {video['title']}")
@@ -1087,14 +1228,159 @@ class YouTubeMonitor:
                 # 获取应用偏移量前的完整筛选结果
                 original_filtered = self._filter_videos(videos, config)
                 self._update_historical_progress(config_id, original_filtered, added_count)
-            
-            return True, f"监控完成，处理了 {processed_count} 个新视频，添加了 {added_count} 个到任务队列{quota_note}"
-            
+
+            run_stats['processed_count'] = processed_count
+            run_stats['added_count'] = added_count
+            message = (
+                f"监控完成，处理了 {processed_count} 个新视频，添加了 {added_count} 个到任务队列"
+                f"{ai_note}{quota_note}"
+            )
+            self._notify_monitor_run(config, run_stats, success=True, message=message)
+            return True, message
+
         except Exception as e:
             logger.error(f"监控任务执行失败 - 配置: {config['name']} (ID: {config_id}), 错误: {str(e)}")
-            return False, self._format_run_error_message(e)
+            message = self._format_run_error_message(e)
+            self._notify_monitor_run(config, run_stats, success=False, message=message)
+            return False, message
         finally:
             self._release_monitor_run(config_id, run_claim_token)
+
+    def _apply_ai_curation(
+        self,
+        config: Dict[str, Any],
+        config_id: int,
+        candidates: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """给本轮的新候选打分，返回（达到门槛、按分数排好序的候选，统计信息）。
+
+        已处理过的候选先去掉，不浪费模型调用；打过分的直接用缓存。失败时抛 AICurationError。
+        """
+        fresh = [video for video in candidates if not self._is_video_processed(video['id'], config_id)]
+        batch = fresh[:AI_CURATION_MAX_CANDIDATES]
+        criteria = effective_criteria(config.get('ai_filter_criteria'))
+        min_score = normalize_min_score(config.get('ai_filter_min_score'))
+        keywords = str(config.get('keywords') or '')
+        app_config = load_config() or {}
+        fingerprint = verdict_fingerprint(criteria, keywords, app_config.get('OPENAI_MODEL_NAME', ''))
+
+        verdicts = self._load_ai_verdicts(config_id, fingerprint, [video['id'] for video in batch])
+        to_score = [video for video in batch if video['id'] not in verdicts]
+        if to_score:
+            logger.info(f"AI 选题：给 {len(to_score)} 个新候选打分（另有 {len(batch) - len(to_score)} 个用缓存）")
+            new_verdicts = score_videos(to_score, criteria, keywords, app_config, logger=logger)
+            self._save_ai_verdicts(config_id, fingerprint, new_verdicts)
+            verdicts.update(new_verdicts)
+
+        kept, rejected, unscored = rank_by_verdicts(batch, verdicts, min_score)
+        for video in kept:
+            logger.info(f"AI 选题保留（{video['ai_score']} 分）：{video['title'][:80]} | {video.get('ai_reason', '')}")
+        for video in rejected:
+            logger.info(
+                f"AI 选题淘汰（{video['ai_score']} 分 < {min_score}）：{video['title'][:80]} | {video.get('ai_reason', '')}"
+            )
+        if unscored:
+            logger.warning(f"AI 选题：模型漏评 {len(unscored)} 个候选，本轮跳过，下次运行重新打分")
+        if len(fresh) > len(batch):
+            logger.info(f"AI 选题：本轮只评前 {len(batch)} 个新候选，其余 {len(fresh) - len(batch)} 个留到下次")
+
+        rejected_sorted = sorted(rejected, key=lambda video: -int(video.get('ai_score') or 0))
+        summary = {
+            'ai_candidates': len(batch),
+            'ai_kept': len(kept),
+            'ai_rejected': len(rejected),
+            'ai_unscored': len(unscored),
+            'ai_min_score': min_score,
+            'ai_rejected_samples': [
+                {
+                    'id': video['id'],
+                    'title': video.get('title', ''),
+                    'ai_score': video.get('ai_score'),
+                    'ai_reason': video.get('ai_reason', ''),
+                }
+                for video in rejected_sorted[:5]
+            ],
+        }
+        return kept, summary
+
+    def _load_ai_verdicts(self, config_id, fingerprint, video_ids) -> Dict[str, Tuple[int, str]]:
+        if not video_ids:
+            return {}
+        verdicts: Dict[str, Tuple[int, str]] = {}
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            for start in range(0, len(video_ids), 200):
+                chunk = list(video_ids[start:start + 200])
+                placeholders = ','.join('?' * len(chunk))
+                rows = conn.execute(
+                    f'SELECT video_id, score, reason FROM monitor_ai_verdicts '
+                    f'WHERE config_id = ? AND fingerprint = ? AND video_id IN ({placeholders})',
+                    [config_id, fingerprint, *chunk],
+                ).fetchall()
+                for video_id, score, reason in rows:
+                    verdicts[video_id] = (int(score), reason or '')
+        return verdicts
+
+    # 评分缓存保留天数：搜索窗口一般不超过 30 天，更早的候选不会再出现
+    _AI_VERDICT_RETENTION_DAYS = 60
+
+    def _save_ai_verdicts(self, config_id, fingerprint, verdicts: Dict[str, Tuple[int, str]]) -> None:
+        if not verdicts:
+            return
+        now = time.time()
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            conn.executemany(
+                'INSERT OR REPLACE INTO monitor_ai_verdicts '
+                '(config_id, video_id, fingerprint, score, reason, scored_at) VALUES (?, ?, ?, ?, ?, ?)',
+                [
+                    (config_id, video_id, fingerprint, int(score), reason or '', now)
+                    for video_id, (score, reason) in verdicts.items()
+                ],
+            )
+            conn.execute(
+                'DELETE FROM monitor_ai_verdicts WHERE scored_at < ?',
+                (now - self._AI_VERDICT_RETENTION_DAYS * 86400,),
+            )
+            conn.commit()
+
+    def _notify_monitor_run(self, config: Dict[str, Any], stats: Dict[str, Any], *, success: bool, message: str) -> None:
+        """运行结束后发通知：有异常发「监控异常」，否则发「监控运行完成」，各自受事件开关控制。"""
+        try:
+            alert_reason = ''
+            if not success:
+                alert_reason = message
+            elif getattr(self, '_last_fetch_quota_skipped', False):
+                alert_reason = '今日 YouTube 搜索配额已用完，本轮跳过（太平洋时间零点重置）'
+            elif getattr(self, '_last_fetch_had_errors', False):
+                alert_reason = '本轮抓取有错误，结果可能不完整'
+            elif not stats.get('fetched_count') and not str(config.get('channel_ids') or '').strip():
+                # 只对关键词搜索报警：频道监控在频道没发新视频时 0 结果是常态
+                alert_reason = '搜索没有返回任何视频，请检查关键词、时间范围和内容类型设置'
+            event_type = EVENT_MONITOR_ALERT if alert_reason else EVENT_MONITOR_RUN_FINISHED
+
+            from .notifications import is_notification_event_enabled
+            if not is_notification_event_enabled(load_config() or {}, event_type):
+                return
+            payload = {
+                'config_id': config.get('id'),
+                'config_name': config.get('name', ''),
+                'success': bool(success),
+                'message': message,
+                'alert_reason': alert_reason,
+                'fetched_count': int(stats.get('fetched_count') or 0),
+                'filtered_count': int(stats.get('filtered_count') or 0),
+                'processed_count': int(stats.get('processed_count') or 0),
+                'added_count': int(stats.get('added_count') or 0),
+                'added_videos': list(stats.get('added_videos') or [])[:10],
+                'ai_enabled': bool(stats.get('ai_enabled')),
+                'ai_error': str(stats.get('ai_error') or ''),
+                'ai_candidates': int(stats.get('ai_candidates') or 0),
+                'ai_kept': int(stats.get('ai_kept') or 0),
+                'ai_min_score': stats.get('ai_min_score'),
+                'ai_rejected_samples': list(stats.get('ai_rejected_samples') or [])[:5],
+            }
+            emit_notification_event(NotificationEvent(event_type=event_type, payload=payload))
+        except Exception as exc:
+            logger.warning(f"发送监控通知失败: {exc}")
     
     def _fetch_trending_videos(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """获取视频"""
@@ -1716,7 +2002,10 @@ class YouTubeMonitor:
                 'duration': video['contentDetails']['duration'],
                 'view_count': int(video['statistics'].get('viewCount', 0)),
                 'like_count': int(video['statistics'].get('likeCount', 0)),
-                'comment_count': int(video['statistics'].get('commentCount', 0))
+                'comment_count': int(video['statistics'].get('commentCount', 0)),
+                # 简介和标签只给 AI 选题看，不写进监控历史
+                'description': str(video['snippet'].get('description') or ''),
+                'tags': list(video['snippet'].get('tags') or []) if isinstance(video['snippet'].get('tags'), list) else [],
             }
             # 基于 API 字段的内容类型判定：live 优先，其次 shorts，再否则 video
             try:
@@ -1882,8 +2171,9 @@ class YouTubeMonitor:
         if not self._title_matches(video_info['title'], config):
             return False
 
-        # 标题只有话题标签 / 表情时，自动翻译必然失败，加进来只会卡在人工审核
-        if skip_untranslatable_titles and not has_translatable_content(video_info['title'], 'title'):
+        # 标题只有话题标签 / 表情时，自动翻译必然失败，加进来只会卡在人工审核；
+        # 只剩「シ」这类颜文字的标题能翻译，但译出来还是「シ」，同样跳过
+        if skip_untranslatable_titles and not has_enough_title_text(video_info['title']):
             logger.info(f"标题没有可翻译的文字，跳过: {str(video_info['title'])[:80]}")
             return False
 
@@ -1950,8 +2240,8 @@ class YouTubeMonitor:
                 INSERT OR IGNORE INTO monitor_history (
                     config_id, video_id, video_type, video_title, channel_title,
                     view_count, like_count, comment_count, duration,
-                    published_at, added_to_tasks
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    published_at, added_to_tasks, ai_score, ai_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             ''', (
                 config_id,
                 video_info['id'],
@@ -1963,6 +2253,8 @@ class YouTubeMonitor:
                 video_info['comment_count'],
                 video_info['duration'],
                 video_info['published_at'],
+                video_info.get('ai_score'),
+                video_info.get('ai_reason') or None,
             ))
             inserted = cursor.rowcount == 1
             conn.commit()
@@ -2499,21 +2791,30 @@ class YouTubeMonitor:
         try:
             config = self.get_monitor_config(config_id)
             config_name = config['name'] if config else f"ID-{config_id}"
-            
+
+            # 设了对齐时刻时，以「今天 HH:MM」为起点每隔 interval 触发：保存设置或重启
+            # 不会把每天的运行时刻挪到保存/重启的那一刻（未设置时保持原行为）。
+            anchor_time = parse_schedule_time((config or {}).get('schedule_time'))
+            job_kwargs = {}
+            if anchor_time:
+                job_kwargs['start_date'] = schedule_anchor(*anchor_time)
+
             self.scheduler.add_job(
                 func=self.run_monitor,
                 trigger='interval',
                 minutes=interval_minutes,
                 id=job_id,
                 args=[config_id],
-                replace_existing=True
+                replace_existing=True,
+                **job_kwargs,
             )
-            
+
             if not self.scheduler.running:
                 self.scheduler.start()
                 logger.info("调度器已启动")
-                
-            logger.info(f"添加监控调度任务: {config_name} ({job_id}), 间隔: {interval_minutes}分钟")
+
+            anchor_note = f"，对齐时刻 {anchor_time[0]:02d}:{anchor_time[1]:02d}" if anchor_time else ""
+            logger.info(f"添加监控调度任务: {config_name} ({job_id}), 间隔: {interval_minutes}分钟{anchor_note}")
         except Exception as e:
             logger.error(f"添加调度任务失败: {str(e)}")
     
@@ -2647,6 +2948,15 @@ class YouTubeMonitor:
             self._schedule_monitor(config['id'], run_interval)
             # 仅当定时任务此前不存在时才安排「启动后立即检查」，避免每次保存都绕过每日预算
             if immediate and not job_existed:
+                # 对齐调度：上次运行还在一个间隔内，说明没错过，等到对齐时刻再跑；
+                # 否则（从未运行或停机错过了）照常补跑一次。
+                if (parse_schedule_time(config.get('schedule_time'))
+                        and not missed_scheduled_run(config.get('last_run_time'), run_interval)):
+                    logger.info(
+                        f"{config['name']} (ID: {config['id']}) 使用对齐调度，上次运行未超过一个间隔，"
+                        "启动后不立即检查"
+                    )
+                    continue
                 try:
                     self.scheduler.add_job(
                         func=self.run_monitor,

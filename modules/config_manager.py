@@ -168,6 +168,8 @@ DEFAULT_CONFIG = {
     "NOTIFY_EVENT_LOGIN_LOCKED": True,
     "NOTIFY_EVENT_QR_LOGIN_SUCCESS": True,
     "NOTIFY_EVENT_QR_LOGIN_FAILED": True,
+    "NOTIFY_EVENT_MONITOR_RUN_FINISHED": False,  # 监控每轮运行摘要（搜到多少、AI 保留多少、加了哪些任务）
+    "NOTIFY_EVENT_MONITOR_ALERT": True,  # 监控异常：运行失败、AI 选题失败、搜索 0 结果、配额跳过
     "NOTIFY_WECOM_ENABLED": False,
     "NOTIFY_WECOM_WEBHOOK_URL": "",
     "NOTIFY_SERVERCHAN_ENABLED": False,

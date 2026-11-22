@@ -2363,6 +2363,14 @@
                                                         <input type="checkbox" name="NOTIFY_EVENT_QR_LOGIN_FAILED" {% if config.get('NOTIFY_EVENT_QR_LOGIN_FAILED', True) %}checked{% endif %}>
                                                         扫码登录失败
                                                     </label>
+                                                    <label class="checkbox-label">
+                                                        <input type="checkbox" name="NOTIFY_EVENT_MONITOR_RUN_FINISHED" {% if config.get('NOTIFY_EVENT_MONITOR_RUN_FINISHED', False) %}checked{% endif %}>
+                                                        监控运行摘要
+                                                    </label>
+                                                    <label class="checkbox-label">
+                                                        <input type="checkbox" name="NOTIFY_EVENT_MONITOR_ALERT" {% if config.get('NOTIFY_EVENT_MONITOR_ALERT', True) %}checked{% endif %}>
+                                                        监控异常（失败、0 结果、配额跳过）
+                                                    </label>
                                                 </div>
                                                     </div>
                                                 </div>

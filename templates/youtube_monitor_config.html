@@ -405,6 +405,43 @@
                 </div>
             </div>
 
+            <!-- AI 选题 -->
+            <div class="card mt-4">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="bi bi-stars"></i> AI 选题</h5>
+                </div>
+                <div class="card-body">
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" id="ai_filter_enabled" name="ai_filter_enabled"
+                               {% if config and config.ai_filter_enabled %}checked{% endif %}>
+                        <label class="form-check-label" for="ai_filter_enabled">启用 AI 选题</label>
+                        <div class="form-text">
+                            通过上面的筛选条件后，用设置页的 AI 模型按下面的选题标准给本轮新候选打 0–10 分，
+                            只把达到最低分的视频按分数从高到低加入任务队列。挡得住关键词对得上、内容却不对的视频，
+                            例如诊所广告、借用关键词的搞笑短剧、只有话题标签的短视频。
+                            每轮一次模型调用，只发送标题、频道、时长、播放数据、简介前 400 字和标签。
+                            模型调用失败时这一轮不添加任务，下次运行重试。
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="ai_filter_criteria" class="form-label">选题标准</label>
+                        <textarea class="form-control" id="ai_filter_criteria" name="ai_filter_criteria" rows="4" maxlength="1500"
+                                  placeholder="留空则使用通用标准：{{ monitor_ai_default_criteria }}">{{ config.ai_filter_criteria if config and config.ai_filter_criteria else '' }}</textarea>
+                        <div class="form-text">用一两段话写清楚要什么、不要什么，例如账号定位、想要的内容类型、要排除的广告或段子。</div>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="ai_filter_min_score" class="form-label">最低分（0–10）</label>
+                                <input type="number" class="form-control" id="ai_filter_min_score" name="ai_filter_min_score"
+                                       value="{{ config.ai_filter_min_score if is_edit and config.ai_filter_min_score is not none else monitor_ai_default_min_score }}" min="0" max="10">
+                                <div class="form-text">默认 {{ monitor_ai_default_min_score }} 分。调高更挑剔，调低更宽松。</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- 调度与限制设置 -->
             <div class="card mt-4">
                 <div class="card-header">
@@ -430,6 +467,14 @@
                                 <div class="form-text">
                                     执行间隔，同时作为API请求的时间窗口（推荐30分钟以上，最长30天）<br>
                                     <small class="text-primary" id="interval_display">约等于 2 小时</small>
+                                </div>
+                                <label for="schedule_time" class="form-label mt-3">对齐时刻（可选）</label>
+                                <input type="time" class="form-control" id="schedule_time" name="schedule_time"
+                                       value="{{ config.schedule_time if config and config.schedule_time else '' }}">
+                                <div class="form-text">
+                                    按服务器时区（docker-compose 里的 TZ，默认 Asia/Shanghai）从这个时刻起每隔一个间隔运行，
+                                    例如间隔 1440 分钟、对齐 17:00 就是每天 17:00。保存设置或重启服务不会再挪动运行时刻；
+                                    重启时如果错过了上一次运行，会立即补跑一次。留空则从保存或启动的时刻起算。
                                 </div>
                             </div>
                         </div>

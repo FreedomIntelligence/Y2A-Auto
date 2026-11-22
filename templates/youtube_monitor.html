@@ -106,7 +106,8 @@
                         </td>
                         <td class="text-center" data-label="调度类型">
                             {% if config.schedule_type == 'auto' %}
-                            <span class="badge bg-info text-dark">自动({{ config.schedule_interval }}分钟)</span>
+                            <span class="badge bg-info text-dark">自动({{ config.schedule_interval }}分钟{% if config.schedule_time %}，对齐 {{ config.schedule_time }}{% endif %})</span>
+                            {% if config.ai_filter_enabled %}<br><span class="badge bg-success mt-1" title="已启用 AI 选题，最低 {{ config.ai_filter_min_score }} 分">AI 选题</span>{% endif %}
                             {% else %}
                             <span class="badge bg-warning text-dark">手动</span>
                             {% endif %}
@@ -199,6 +200,9 @@
                                 {% endif %}
                                 {{ record.video_title }}
                             </div>
+                            {% if record.ai_score is not none %}
+                                <small class="text-muted d-block" title="AI 选题评分"><span class="badge {% if record.ai_score >= 8 %}bg-success{% elif record.ai_score >= 6 %}bg-primary{% else %}bg-secondary{% endif %}">AI {{ record.ai_score }} 分</span> {{ record.ai_reason or '' }}</small>
+                            {% endif %}
                         </td>
                         <td data-label="频道">{{ record.channel_title }}</td>
                         <td data-label="观看数">{{ record.view_count|int }}</td>

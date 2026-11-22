@@ -12,7 +12,7 @@
 
 从下载、ASR、字幕翻译、字幕质检、内容审核到上传，全流程自动化；内置 Web 管理后台、YouTube 监控和维护能力。
 
-> **FreedomIntelligence 分支**：fork 自 [fqscfqj/Y2A-Auto](https://github.com/fqscfqj/Y2A-Auto)，在无人值守向 bilibili 搬运的场景下补了几处：多语种标题翻译、只有导流内容的简介留空、监控跳过纯话题标签标题、投稿最小间隔、限流与网络失败自动重试、投稿账号校验；监控排除直播时不再给搜索加 `eventType=completed`（它只返回直播回放，会让整轮搜不到视频）。相关配置见[账号与网络](#账号与网络)和[AI 与投稿](#ai-与投稿)。
+> **FreedomIntelligence 分支**：fork 自 [fqscfqj/Y2A-Auto](https://github.com/fqscfqj/Y2A-Auto)，在无人值守向 bilibili 搬运的场景下补了几处：多语种标题翻译、只有导流内容的简介留空、监控跳过纯话题标签标题、投稿最小间隔、限流与网络失败自动重试、投稿账号校验；监控排除直播时不再给搜索加 `eventType=completed`（它只返回直播回放，会让整轮搜不到视频）；监控可开 AI 选题（按选题标准给候选打分，挡掉广告和借用关键词的视频，按分数排序入队）、设置对齐时刻（保存设置或重启不再挪动每天的运行时间），每轮运行后可推送摘要或异常提醒。相关配置见[账号与网络](#账号与网络)、[AI 与投稿](#ai-与投稿)和 [YouTube 监控](#youtube-监控)。
 
 [快速开始](#快速开始) · [功能概览](#功能概览) · [部署与运行](#部署与运行) · [Telegram 机器人](#方案-dtelegram-转发机器人可选) · [配置说明](#配置说明) · [使用指南](#使用指南) · [通知推送](#通知推送) · [CookieCloud](#cookiecloud-集成) · [安全特性](#安全特性) · [常见问题](#常见问题)
 
@@ -350,7 +350,7 @@ AI 文本功能同时兼容 OpenAI Chat Completions 与 Responses API。`OPENAI_
 
 - `NOTIFY_ENABLED`：启用消息推送，默认 `false`
 - `NOTIFY_CHANNELS`：启用的渠道列表，支持 `wecom`、`serverchan`、`message_pusher`
-- `NOTIFY_EVENTS`：订阅的事件列表，可选 `task_added`、`task_completed`、`task_failed`、`login_success`、`login_locked`、`qr_login_success`、`qr_login_failed`
+- `NOTIFY_EVENTS`：订阅的事件列表，可选 `task_added`、`task_completed`、`task_failed`、`login_success`、`login_locked`、`qr_login_success`、`qr_login_failed`、`monitor_run_finished`、`monitor_alert`
 - 企业微信：`NOTIFY_WECOM_WEBHOOK_URL`
 - Server酱：`NOTIFY_SERVERCHAN_SENDKEY`
 - message-pusher：`NOTIFY_MESSAGE_PUSHER_SERVER` / `NOTIFY_MESSAGE_PUSHER_USERNAME` / `NOTIFY_MESSAGE_PUSHER_TOKEN`
@@ -525,6 +525,9 @@ group_add:
 - 支持标题包含关键词过滤（任一 / 全部匹配），可只搬运标题命中特定内容的视频（如某个频道的 ASMR）；多个关键词用逗号或空格分隔，含空格的短语用引号包住（如 `"deep sleep"`）
 - 支持视频类型筛选：video / short / live
 - 可设置自动添加到任务队列，并保留监控历史记录
+- AI 选题（监控配置里的「AI 选题」）：规则过滤之后，用设置页的 AI 模型按「选题标准」给本轮新候选打 0–10 分，只把达到「最低分」（默认 6）的视频按分数从高到低加入任务队列，评分和理由显示在监控历史里。挡得住关键词对得上、内容却不对的视频，例如诊所和品牌广告、借用关键词的搞笑短剧、只有话题标签的短视频。每轮一次模型调用，只发送标题、频道、时长、播放数据、简介前 400 字和标签；被淘汰的候选不写进监控历史，评分缓存在 `monitor_ai_verdicts` 表里，选题标准、关键词或模型变了才重新打分。模型调用失败时这一轮不添加任务，下次运行重试
+- 对齐时刻（自动调度的可选项，`HH:MM`，按服务器时区）：从这个时刻起每隔一个调度间隔运行一次，例如间隔 1440 分钟、对齐 17:00 就是每天 17:00。不设置时，保存监控或设置页、重启服务都会把下次运行重置为「当时 + 间隔」；设置后运行时刻固定，重启时只有错过了上一次运行才会立即补跑
+- 标题过滤（`MONITOR_SKIP_UNTRANSLATABLE_TITLES`）同时跳过去掉话题标签和表情后只剩「シ」「ㅋㅋ」这类颜文字的标题
 - 配置文件会保存到 `config/youtube_monitor/`，历史数据库位于 `db/youtube_monitor.db`
 
 ## 通知推送
@@ -546,6 +549,8 @@ group_add:
 - `login_locked`：登录锁定
 - `qr_login_success`：QR 码登录成功
 - `qr_login_failed`：QR 码登录失败
+- `monitor_run_finished`：监控运行完成（`NOTIFY_EVENT_MONITOR_RUN_FINISHED`，默认关闭）：搜到多少、规则和 AI 选题后剩多少、加了哪些任务（带 AI 评分）、AI 淘汰了哪些
+- `monitor_alert`：监控异常（`NOTIFY_EVENT_MONITOR_ALERT`，默认开启）：运行失败、AI 选题失败、搜索 0 结果、配额跳过或抓取出错；这时只发异常，不再发运行摘要
 
 通知采用异步重试队列（SQLite outbox），递增间隔（30s → 120s → 600s → 1800s → 3600s）保证最终投递。企业微信优先使用 Markdown 格式，失败后自动回退纯文本。
 

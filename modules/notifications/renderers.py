@@ -6,6 +6,8 @@ from typing import Any
 from .models import (
     EVENT_LOGIN_LOCKED,
     EVENT_LOGIN_SUCCESS,
+    EVENT_MONITOR_ALERT,
+    EVENT_MONITOR_RUN_FINISHED,
     EVENT_QR_LOGIN_FAILED,
     EVENT_QR_LOGIN_SUCCESS,
     EVENT_TASK_ADDED,
@@ -75,6 +77,82 @@ def _kv(label: str, value: Any) -> str:
 def _section_block(*kv_lines: str) -> str:
     """将多行键值组装成引用块。"""
     return "\n".join(f"> {line}" for line in kv_lines if _as_text(line))
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _monitor_video_line(index: int, video: Any) -> str:
+    if not isinstance(video, dict):
+        return ""
+    title = _truncate(_as_text(video.get("title")), 80) or _as_text(video.get("id"))
+    score = _as_int(video.get("ai_score"))
+    prefix = f"[{score}分] " if score is not None else ""
+    reason = _truncate(_as_text(video.get("ai_reason")), 40)
+    suffix = f"（{reason}）" if reason else ""
+    return f"{index}. {prefix}{title}{suffix}"
+
+
+def _build_monitor_message(event_type: str, payload: dict[str, Any]) -> NotificationMessage:
+    """监控运行摘要 / 监控异常。payload 由 youtube_monitor.run_monitor 生成。"""
+    name = _as_text(payload.get("config_name")) or f"监控 {_as_text(payload.get('config_id'))}"
+    added = _as_int(payload.get("added_count")) or 0
+    is_alert = event_type == EVENT_MONITOR_ALERT
+    alert_reason = _truncate(_as_text(payload.get("alert_reason")), 300)
+
+    ai_line = ""
+    if payload.get("ai_enabled"):
+        if payload.get("ai_error"):
+            ai_line = _kv("AI 选题", f"失败：{_truncate(_as_text(payload.get('ai_error')), 200)}")
+        else:
+            ai_line = _kv(
+                "AI 选题",
+                f"新候选 {_as_int(payload.get('ai_candidates')) or 0} 个，"
+                f"保留 {_as_int(payload.get('ai_kept')) or 0} 个（门槛 {_as_int(payload.get('ai_min_score'))} 分）",
+            )
+
+    body = _section_block(
+        _kv("监控", name),
+        _kv("异常", alert_reason) if is_alert else "",
+        _kv("搜索结果", f"{_as_int(payload.get('fetched_count')) or 0} 个"),
+        _kv("规则过滤后", f"{_as_int(payload.get('filtered_count')) or 0} 个"),
+        ai_line,
+        _kv("加入任务队列", f"{added} 个"),
+        _kv("时间", _as_text(payload.get("occurred_at"))),
+    )
+
+    lines = []
+    added_videos = payload.get("added_videos") if isinstance(payload.get("added_videos"), list) else []
+    for index, video in enumerate(added_videos[:10], 1):
+        line = _monitor_video_line(index, video)
+        if line:
+            lines.append(f"> {line}")
+    rejected = payload.get("ai_rejected_samples") if isinstance(payload.get("ai_rejected_samples"), list) else []
+    rejected_lines = []
+    for index, video in enumerate(rejected[:5], 1):
+        line = _monitor_video_line(index, video)
+        if line:
+            rejected_lines.append(f"> {line}")
+
+    if is_alert:
+        title = "Y2A-Auto ⚠️ 监控异常"
+        summary = f"{name} | {alert_reason or '请检查监控配置'}"
+        heading = "**⚠️ 监控异常**"
+    else:
+        title = "Y2A-Auto 🔎 监控运行完成"
+        summary = f"{name} | 新增任务 {added} 个"
+        heading = "**🔎 监控运行完成**"
+
+    parts = [heading, "", body]
+    if lines:
+        parts += ["", "> **本轮加入的视频：**", *lines]
+    if rejected_lines:
+        parts += ["", "> **AI 淘汰的部分候选：**", *rejected_lines]
+    return NotificationMessage(title=title, summary=summary, markdown=_markdown_lines(*parts))
 
 
 def build_notification_message(event: NotificationEvent) -> NotificationMessage:
@@ -167,6 +245,9 @@ def build_notification_message(event: NotificationEvent) -> NotificationMessage:
         )
         markdown = _markdown_lines(f"**{icon} {platform}扫码登录{status_text}**", "", body)
         return NotificationMessage(title=title, summary=summary, markdown=markdown)
+
+    if event_type in (EVENT_MONITOR_RUN_FINISHED, EVENT_MONITOR_ALERT):
+        return _build_monitor_message(event_type, payload)
 
     title = "Y2A-Auto 💬 系统通知"
     serialized = json.dumps(payload, ensure_ascii=False)

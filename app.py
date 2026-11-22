@@ -622,6 +622,19 @@ def _normalize_title_match_mode(value) -> str:
     return mode if mode in TITLE_MATCH_MODES else 'any'
 
 
+def _parse_monitor_extra_fields(form) -> dict:
+    """监控表单里 AI 选题和对齐时刻相关的字段（新建、编辑共用）。"""
+    from modules.monitor_curation import normalize_criteria, normalize_min_score
+    from modules.youtube_monitor import normalize_schedule_time
+
+    return {
+        'ai_filter_enabled': 'ai_filter_enabled' in form,
+        'ai_filter_criteria': normalize_criteria(form.get('ai_filter_criteria')),
+        'ai_filter_min_score': normalize_min_score(form.get('ai_filter_min_score')),
+        'schedule_time': normalize_schedule_time(form.get('schedule_time')),
+    }
+
+
 def _get_cover_file_info(path: str):
     ext = os.path.splitext(str(path or ''))[1].lower()
     return ext, ALLOWED_COVER_EXTENSIONS.get(ext)
@@ -830,6 +843,8 @@ SETTINGS_CHECKBOX_FIELDS = list(dict.fromkeys([
     'NOTIFY_EVENT_LOGIN_LOCKED',
     'NOTIFY_EVENT_QR_LOGIN_SUCCESS',
     'NOTIFY_EVENT_QR_LOGIN_FAILED',
+    'NOTIFY_EVENT_MONITOR_RUN_FINISHED',
+    'NOTIFY_EVENT_MONITOR_ALERT',
     'NOTIFY_WECOM_ENABLED',
     'NOTIFY_SERVERCHAN_ENABLED',
     'NOTIFY_MESSAGE_PUSHER_ENABLED',
@@ -1953,6 +1968,11 @@ def get_aliyun_label_chinese(label_value):
     """获取阿里云审核标签的中文含义"""
     return ALIYUN_LABEL_MAP.get(label_value, label_value) # 如果找不到映射，返回原始标签
 
+from modules.monitor_curation import (
+    DEFAULT_AI_FILTER_CRITERIA as _MONITOR_AI_DEFAULT_CRITERIA,
+    DEFAULT_AI_FILTER_MIN_SCORE as _MONITOR_AI_DEFAULT_MIN_SCORE,
+)
+
 # 注册模板辅助函数
 app.jinja_env.globals.update(
     task_status_display=task_status_display,
@@ -1961,6 +1981,8 @@ app.jinja_env.globals.update(
     parse_json=parse_json,
     get_aliyun_label_chinese=get_aliyun_label_chinese, # 添加新的辅助函数
     submit_api_badge=bilibili_submit_api_badge, # 任务列表里的投稿接口徽标
+    monitor_ai_default_criteria=_MONITOR_AI_DEFAULT_CRITERIA, # 监控 AI 选题的通用默认标准
+    monitor_ai_default_min_score=_MONITOR_AI_DEFAULT_MIN_SCORE,
 )
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -4208,7 +4230,8 @@ def youtube_monitor_config():
                 'rate_limit_requests': safe_int(request.form.get('rate_limit_requests'), 20),
                 'rate_limit_window': safe_int(request.form.get('rate_limit_window'), 60),
                 'auto_add_to_tasks': 'auto_add_to_tasks' in request.form,
-                'video_types': ','.join(request.form.getlist('video_types') or ['video','short','live'])
+                'video_types': ','.join(request.form.getlist('video_types') or ['video','short','live']),
+                **_parse_monitor_extra_fields(request.form),
             }
             
             # 验证必填项
@@ -4280,7 +4303,8 @@ def youtube_monitor_config_edit(config_id):
                 'rate_limit_requests': safe_int(request.form.get('rate_limit_requests'), 20),
                 'rate_limit_window': safe_int(request.form.get('rate_limit_window'), 60),
                 'auto_add_to_tasks': 'auto_add_to_tasks' in request.form,
-                'video_types': ','.join(request.form.getlist('video_types') or ['video','short','live'])
+                'video_types': ','.join(request.form.getlist('video_types') or ['video','short','live']),
+                **_parse_monitor_extra_fields(request.form),
             }
             
             # 验证必填项

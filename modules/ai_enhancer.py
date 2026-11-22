@@ -335,6 +335,29 @@ def has_translatable_content(text: Any, content_type: str = "description") -> bo
     return _has_meaningful_content(cleaned, content_type=ct)
 
 
+# 单独出现时只是颜文字的字母：「シ」「ツ」常被当笑脸用（如「🦷🎀🦷 シ」），
+# 韩文「ㅋㅋ」「ㅎㅎ」「ㅠㅠ」是笑声和哭脸。它们按 Unicode 算字母，但不构成标题。
+_EMOTICON_LETTERS = frozenset('シツッㅋㅎㅠㅜ')
+
+
+def has_enough_title_text(text: Any, min_letters: int = 2) -> bool:
+    """标题去掉链接、话题标签、@ 账号和表情后，是否还剩至少 min_letters 个字母。
+
+    比 has_translatable_content 更严：只剩一个「シ」这类颜文字的标题，翻译出来还是
+    「シ」，能通过翻译校验却毫无信息量。监控用它跳过这类标题。
+    """
+    raw = safe_str(text)
+    if not raw.strip():
+        return False
+    cleaned = _pre_clean(raw, content_type='title', max_blocks=None)
+    letters = 0
+    for token in _MEANINGFUL_TEXT_RE.findall(cleaned):
+        if all(ch in _EMOTICON_LETTERS for ch in token):
+            continue
+        letters += len(token)
+    return letters >= max(1, int(min_letters))
+
+
 _LANGUAGE_NAME_MAP = {
     "zh": "简体中文",
     "en": "English",

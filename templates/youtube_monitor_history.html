@@ -155,6 +155,12 @@
                         {% endif %}
                         {{ record.video_title }}
                     </div>
+                    {% if record.ai_score is not none %}
+                        <small class="text-muted d-block" title="AI 选题评分">
+                            <span class="badge {% if record.ai_score >= 8 %}bg-success{% elif record.ai_score >= 6 %}bg-primary{% else %}bg-secondary{% endif %}">AI {{ record.ai_score }} 分</span>
+                            {{ record.ai_reason or '' }}
+                        </small>
+                    {% endif %}
                 </td>
                 <td>
                     <div class="text-truncate-150" title="{{ record.channel_title }}">
