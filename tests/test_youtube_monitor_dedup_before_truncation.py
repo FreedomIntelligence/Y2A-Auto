@@ -226,6 +226,42 @@ class SearchKeywordQueryTests(unittest.TestCase):
         self.assertEqual(videos, [])
         self.assertTrue(monitor._last_fetch_had_errors)
 
+    def _search_params_for(self, video_types, channel=False):
+        monitor = self._new_monitor()
+        monitor._try_consume_quota = lambda amount, config_id=None: True
+
+        def execute(request, _operation, quota_consumer=None, **_kwargs):
+            if request == 'search.list':
+                return {'items': [{'id': {'videoId': 'v1'}}]}
+            return {'items': [_make_raw_video('v1')]}
+
+        monitor._execute_with_retry = execute
+        config = dict(self._config('alpha'), video_types=video_types, channel_keywords='alpha')
+        if channel:
+            monitor._fetch_channel_search_videos('UCtest', config, '2024-01-01T00:00:00Z')
+        else:
+            monitor._fetch_search_videos(config, '2024-01-01T00:00:00Z')
+        search_calls = [params for kind, params in monitor.youtube.calls if kind == 'search.list']
+        self.assertEqual(len(search_calls), 1)
+        return search_calls[0]
+
+    def test_excluding_live_does_not_limit_search_to_completed_broadcasts(self):
+        # eventType=completed 只返回已结束的直播（回放），排除直播应交给详情阶段的类型过滤
+        for channel in (False, True):
+            with self.subTest(channel=channel):
+                params = self._search_params_for('video,short', channel=channel)
+                self.assertNotIn('eventType', params)
+
+    def test_live_only_keeps_live_event_filter(self):
+        for channel in (False, True):
+            with self.subTest(channel=channel):
+                params = self._search_params_for('live', channel=channel)
+                self.assertEqual(params.get('eventType'), 'live')
+
+    def test_all_types_send_no_event_filter(self):
+        params = self._search_params_for('video,short,live')
+        self.assertNotIn('eventType', params)
+
 
 class DedupBeforeTruncationTests(unittest.TestCase):
     def setUp(self):
