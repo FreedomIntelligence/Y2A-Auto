@@ -12,7 +12,7 @@
 
 从下载、ASR、字幕翻译、字幕质检、内容审核到上传，全流程自动化；内置 Web 管理后台、YouTube 监控和维护能力。
 
-> **FreedomIntelligence 分支**：fork 自 [fqscfqj/Y2A-Auto](https://github.com/fqscfqj/Y2A-Auto)，在无人值守向 bilibili 搬运的场景下补了几处：多语种标题翻译、只有导流内容的简介留空、监控跳过纯话题标签标题、投稿最小间隔、限流与网络失败自动重试、投稿账号校验。相关配置见[账号与网络](#账号与网络)和[AI 与投稿](#ai-与投稿)。
+> **FreedomIntelligence 分支**：fork 自 [fqscfqj/Y2A-Auto](https://github.com/fqscfqj/Y2A-Auto)，在无人值守向 bilibili 搬运的场景下补了几处：多语种标题翻译、只有导流内容的简介留空、监控跳过纯话题标签标题、投稿最小间隔、限流与网络失败自动重试、投稿账号校验；监控排除直播时不再给搜索加 `eventType=completed`（它只返回直播回放，会让整轮搜不到视频）。相关配置见[账号与网络](#账号与网络)和[AI 与投稿](#ai-与投稿)。
 
 [快速开始](#快速开始) · [功能概览](#功能概览) · [部署与运行](#部署与运行) · [Telegram 机器人](#方案-dtelegram-转发机器人可选) · [配置说明](#配置说明) · [使用指南](#使用指南) · [通知推送](#通知推送) · [CookieCloud](#cookiecloud-集成) · [安全特性](#安全特性) · [常见问题](#常见问题)
 

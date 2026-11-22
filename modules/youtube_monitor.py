@@ -1194,13 +1194,12 @@ class YouTubeMonitor:
         selected_types = str(config.get('video_types', 'video,short,live')).split(',')
         selected_types = [t.strip() for t in selected_types if t.strip()]
         only_live = set(selected_types) == {'live'}
-        include_live = 'live' in set(selected_types)
-        only_non_live = not include_live
-        # live 精准过滤在搜索阶段；Shorts 不使用 videoDuration=short（过宽），改为详情阶段判断
+        # 只选直播时在搜索阶段用 eventType=live。排除直播时不能传 eventType=completed：
+        # 它的意思是「只要已结束的直播」，返回的全是直播回放，详情阶段又按类型全部滤掉，
+        # 整轮 0 个视频（2026-11-22 实测 40/40 都是直播回放）。排除直播交给详情阶段的类型过滤。
+        # Shorts 不使用 videoDuration=short（过宽），同样在详情阶段判断。
         if only_live:
             search_params['eventType'] = 'live'
-        elif only_non_live:
-            search_params['eventType'] = 'completed'
         
         # 添加结束日期限制
         if published_before:
@@ -1361,12 +1360,9 @@ class YouTubeMonitor:
             selected_types = str(config.get('video_types', 'video,short,live')).split(',')
             selected_types = [t.strip() for t in selected_types if t.strip()]
             only_live = set(selected_types) == {'live'}
-            include_live = 'live' in set(selected_types)
-            only_non_live = not include_live
+            # 同上：排除直播时不传 eventType=completed（那只会返回直播回放），交给详情阶段过滤
             if only_live:
                 search_params['eventType'] = 'live'
-            elif only_non_live:
-                search_params['eventType'] = 'completed'
             
             # 添加结束日期限制
             if published_before:
