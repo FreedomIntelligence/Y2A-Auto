@@ -92,6 +92,9 @@ GUARD_CASES = (
     ('SUBTITLE_QC_MIN_COVERAGE_RATIO', '3', 0.15),
     ('SUBTITLE_QC_MAX_GAP_S', '-10', 90.0),
     ('SUBTITLE_QC_MAX_CPS', '99999', 25.0),
+    ('BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES', '5000', 30.0),
+    ('BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES', '-5', 30.0),
+    ('UPLOAD_AUTO_RETRY_MAX_ATTEMPTS', '99', 3.0),
 )
 
 # (键, 提交值, 期望落盘值):非数字提交在归一化阶段被回退，范围校验看不到它，
@@ -114,6 +117,9 @@ VALID_CASES = (
     ('SUBTITLE_QC_MIN_COVERAGE_RATIO', '0.2', 0.2),
     ('SUBTITLE_QC_MAX_GAP_S', '120', 120.0),
     ('SUBTITLE_QC_MAX_CPS', '30', 30.0),
+    ('BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES', '0', 0.0),
+    ('BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES', '45', 45.0),
+    ('UPLOAD_AUTO_RETRY_MAX_ATTEMPTS', '5', 5.0),
 )
 
 # (窗口, 重叠, 期望落盘重叠)。交叉约束:overlap >= window → clamp(window - 1.0, 下限 0)。

@@ -21,8 +21,25 @@ from urllib.parse import quote, urlsplit
 from apscheduler.schedulers.background import BackgroundScheduler
 from logging.handlers import RotatingFileHandler
 from modules.task_manager import add_task
+from .ai_enhancer import has_translatable_content
 from .config_manager import load_config
 from .utils import get_app_subdir
+
+
+def should_skip_untranslatable_titles(app_config: Optional[Dict[str, Any]]) -> bool:
+    """监控是否跳过只有话题标签 / 表情、无法自动翻译的标题。
+
+    只在开启了标题翻译时生效：这类标题翻译必然失败，任务只会卡进人工审核；
+    不翻译标题的部署则保持原行为。
+    """
+    cfg = app_config or {}
+
+    def _on(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or '').strip().lower() in ('true', '1', 'on', 'yes')
+
+    return _on(cfg.get('MONITOR_SKIP_UNTRANSLATABLE_TITLES', True)) and _on(cfg.get('TRANSLATE_TITLE', False))
 
 class QuotaBudgetExhausted(Exception):
     """当日跨配置 search 配额预算（或该配置公平份额）已耗尽，本轮搜索跳过。"""
@@ -1686,7 +1703,12 @@ class YouTubeMonitor:
     def _filter_videos(self, videos, config):
         """根据配置筛选视频"""
         filtered = []
-        
+        try:
+            skip_untranslatable_titles = should_skip_untranslatable_titles(load_config())
+        except Exception as e:
+            logger.debug(f"读取全局设置失败，不过滤无法翻译的标题: {e}")
+            skip_untranslatable_titles = False
+
         for video in videos:
             # 基本信息
             video_info = {
@@ -1707,7 +1729,8 @@ class YouTubeMonitor:
                 video_info['video_type'] = 'video'
             
             # 应用筛选条件
-            if not self._meets_criteria(video_info, config):
+            if not self._meets_criteria(
+                    video_info, config, skip_untranslatable_titles=skip_untranslatable_titles):
                 continue
                 
             filtered.append(video_info)
@@ -1819,7 +1842,7 @@ class YouTubeMonitor:
             return all(keyword in title_lower for keyword in keywords)
         return any(keyword in title_lower for keyword in keywords)
 
-    def _meets_criteria(self, video_info, config):
+    def _meets_criteria(self, video_info, config, skip_untranslatable_titles=False):
         """检查视频是否符合筛选条件"""
         # 检查开始日期
         if config.get('start_date'):
@@ -1862,7 +1885,12 @@ class YouTubeMonitor:
         # 检查标题包含关键词（仅本地标题匹配，不额外消耗 API 配额）
         if not self._title_matches(video_info['title'], config):
             return False
-        
+
+        # 标题只有话题标签 / 表情时，自动翻译必然失败，加进来只会卡在人工审核
+        if skip_untranslatable_titles and not has_translatable_content(video_info['title'], 'title'):
+            logger.info(f"标题没有可翻译的文字，跳过: {str(video_info['title'])[:80]}")
+            return False
+
         # 检查频道ID过滤
         if config['exclude_channel_ids']:
             exclude_channels = [ch.strip() for ch in config['exclude_channel_ids'].split(',')]

@@ -32,7 +32,12 @@ _URL_PATTERNS = [
 ]
 _EMAIL_RE = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
 _SOCIAL_HANDLE_RE = re.compile(r'@[A-Za-z0-9_]+')
-_HASHTAG_RE = re.compile(r'#[A-Za-z0-9_]+')
+# 话题标签：从 # 开始直到空白或常见标点。覆盖非拉丁文字（#зубы、#دندان）、带表情的（#art🤲）
+# 和首尾相连的（#dental#dentist）写法；只认 ASCII 时这些会残留在标题里。
+# 紧跟在英文字母或数字后面的 # 不算话题开头，保留 C#、F# 这类写法。
+_HASHTAG_RE = re.compile(r'(?<![A-Za-z0-9])#[^\s,.!?;:，。！？；：、()（）\[\]【】"\'“”‘’]+')
+# 去掉 @ 账号或话题后剩下的孤立 #
+_LONE_HASH_RE = re.compile(r'(?<!\S)#+(?!\S)')
 _SPONSOR_URL_PATTERNS = [
     re.compile(r'patreon\.com/[^\s]*', re.IGNORECASE),
     re.compile(r'ko-fi\.com/[^\s]*', re.IGNORECASE),
@@ -51,7 +56,10 @@ _TRAILING_SPACE_RE = re.compile(r'[ \t]+\n')
 _MULTIPLE_NEWLINES_RE = re.compile(r'\n{3,}')
 _LIST_LINE_RE = re.compile(r'^\s*(?:[-*•►]|\d+[.)])\s+', re.IGNORECASE | re.MULTILINE)
 _NON_TEXT_RE = re.compile(r'[^\w\u4e00-\u9fff]+', re.IGNORECASE)
-_MEANINGFUL_TEXT_RE = re.compile(r'[A-Za-z0-9\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+')
+# 任意文字系统的字母（不含数字和下划线）。只认拉丁字母和中日韩文字时，俄语、
+# 马拉雅拉姆语、印地语、阿拉伯语等标题会被误判为「预清洗后无可用内容」而转入人工审核；
+# 不计数字是为了让只有电话号码的简介（如「☎️ 98.360-70-08」）按无内容处理。
+_MEANINGFUL_TEXT_RE = re.compile(r'[^\W\d_]+')
 
 _PROMO_LINE_PATTERNS = [
     re.compile(r'^\s*video playlists?\s*:?', re.IGNORECASE),
@@ -283,6 +291,7 @@ def _pre_clean(text: str, content_type: str = "description", max_blocks: Optiona
     cleaned = _EMAIL_RE.sub('', cleaned)
     cleaned = _SOCIAL_HANDLE_RE.sub('', cleaned)
     cleaned = _HASHTAG_RE.sub('', cleaned)
+    cleaned = _LONE_HASH_RE.sub('', cleaned)
     for pat in _SPONSOR_URL_PATTERNS:
         cleaned = pat.sub('', cleaned)
     for pat in _CTA_PATTERNS:
@@ -310,6 +319,21 @@ def _has_meaningful_content(text: str, content_type: str = "description") -> boo
         return True
     total_chars = sum(len(token) for token in tokens)
     return total_chars > 3 or len(tokens) > 1
+
+
+def has_translatable_content(text: Any, content_type: str = "description") -> bool:
+    """原文去掉链接、话题标签、@ 账号和导流语后，是否还剩可翻译的文字。
+
+    与 translate_video_metadata 的预清洗口径一致。监控阶段用它跳过只有话题标签的
+    标题，上传前校验用它判断简介是否「必须有译文」。
+    """
+    raw = safe_str(text)
+    if not raw.strip():
+        return False
+    ct = 'title' if str(content_type).lower().strip() == 'title' else 'description'
+    cleaned = _pre_clean(raw, content_type=ct, max_blocks=None)
+    return _has_meaningful_content(cleaned, content_type=ct)
+
 
 _LANGUAGE_NAME_MAP = {
     "zh": "简体中文",
@@ -352,6 +376,7 @@ def _post_clean(text: str, content_type: str = "description", max_blocks: Option
     cleaned = _EMAIL_RE.sub('', cleaned)
     cleaned = _SOCIAL_HANDLE_RE.sub('', cleaned)
     cleaned = _HASHTAG_RE.sub('', cleaned)
+    cleaned = _LONE_HASH_RE.sub('', cleaned)
     for pattern in _INTERACTION_PATTERNS:
         cleaned = pattern.sub('', cleaned)
     cleaned = _strip_external_platforms(cleaned)
@@ -1063,15 +1088,22 @@ def translate_video_metadata(
         logger.info("已在提示阶段前执行结构化预清洗（去导流/站外信息/列表化噪声）")
 
     requested_fields = []
+    skipped_fields = []
     if translate_title and raw_title:
         requested_fields.append("title")
     if translate_description and raw_description:
-        requested_fields.append("description")
+        if cleaned_description:
+            requested_fields.append("description")
+        else:
+            # 原简介只有链接、话题标签、联系方式之类的导流信息：按留空处理，不算翻译失败，
+            # 否则这类视频会全部卡在人工审核（上传时仍会追加转载说明和来源链接）。
+            skipped_fields.append("description")
 
     final_result = {
         "success": False,
         "attempts": 0,
         "requested_fields": requested_fields,
+        "skipped_fields": skipped_fields,
         "failed_fields": {},
         "error_message": "",
         "translated_fields": {

@@ -272,6 +272,24 @@ def _bilibili_603_hint(submit_attempts: Optional[Sequence[dict]] = None) -> str:
     )
 
 
+def check_expected_bilibili_account(credential: Any, expected_uid: Any) -> Tuple[bool, str]:
+    """核对 Cookie 里登录的账号（DedeUserID）是否就是设置里要求的 UID。
+
+    扫码登录时登成了别的账号，视频就会投到那个账号去；设置了期望 UID 后，
+    不一致时直接拒绝上传。未设置期望 UID 时不校验。
+    """
+    expected = re.sub(r"\D", "", str(expected_uid or ""))
+    if not expected:
+        return True, ""
+    actual = str(getattr(credential, "dedeuserid", "") or "").strip()
+    if actual == expected:
+        return True, ""
+    return False, (
+        f"bilibili 账号不匹配：当前登录的 UID 是 {actual or '未知'}，设置要求的是 {expected}，已阻止上传。"
+        "请在设置页用正确的账号重新扫码登录，或修改「期望的 bilibili UID」。"
+    )
+
+
 class _BilibiliChunkProgress:
     def __init__(self):
         self._completed = {}
@@ -301,9 +319,11 @@ class _BilibiliChunkProgress:
 class BilibiliUploader:
     """Bilibili uploader based on the internal SDK subset."""
 
-    def __init__(self, cookie_file: str, submit_api: str = "auto"):
+    def __init__(self, cookie_file: str, submit_api: str = "auto", expected_uid: Any = ""):
         self.cookie_file = cookie_file
         self.submit_api = normalize_submit_api(submit_api)
+        # 期望的账号 UID（可选）；设置后登录账号不一致时拒绝上传
+        self.expected_uid = expected_uid
         self.logger = None
         self.task_id = None
 
@@ -346,6 +366,13 @@ class BilibiliUploader:
             credential_ok, credential_msg = validate_credential_remote(credential)
             if not credential_ok:
                 return False, f"Bilibili登录态无效: {credential_msg}。请在设置页重新扫码登录后重试上传。"
+
+            account_ok, account_msg = check_expected_bilibili_account(credential, self.expected_uid)
+            if not account_ok:
+                self.log(account_msg)
+                return False, account_msg
+            if str(self.expected_uid or "").strip():
+                self.log(f"bilibili 账号校验通过（UID {getattr(credential, 'dedeuserid', '')}）")
 
             # 首次运行时生成 buvid3/buvid4/_uuid 并回写 Cookie 文件，
             # 之后每次上传复用同一套设备指纹，避免被当成"每次换设备"。
