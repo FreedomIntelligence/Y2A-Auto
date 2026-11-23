@@ -623,15 +623,16 @@ def _normalize_title_match_mode(value) -> str:
 
 
 def _parse_monitor_extra_fields(form) -> dict:
-    """监控表单里 AI 选题和对齐时刻相关的字段（新建、编辑共用）。"""
+    """监控表单里 AI 选题、对齐时刻和分组搜索相关的字段（新建、编辑共用）。"""
     from modules.monitor_curation import normalize_criteria, normalize_min_score
-    from modules.youtube_monitor import normalize_schedule_time
+    from modules.youtube_monitor import normalize_schedule_time, normalize_search_queries
 
     return {
         'ai_filter_enabled': 'ai_filter_enabled' in form,
         'ai_filter_criteria': normalize_criteria(form.get('ai_filter_criteria')),
         'ai_filter_min_score': normalize_min_score(form.get('ai_filter_min_score')),
         'schedule_time': normalize_schedule_time(form.get('schedule_time')),
+        'search_queries': normalize_search_queries(form.get('search_queries')),
     }
 
 

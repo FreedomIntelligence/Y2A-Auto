@@ -128,8 +128,8 @@
                             <div class="mb-3">
                                 <label for="time_period" class="form-label">时间段（天）</label>
                                 <input type="number" class="form-control" id="time_period" name="time_period" 
-                                       value="{{ config.time_period if config else 7 }}" min="1" max="30">
-                                <div class="form-text">搜索多少天内发布的视频</div>
+                                       value="{{ config.time_period if config else 7 }}" min="1" max="3650">
+                                <div class="form-text">搜索多少天内发布的视频；想找播放量高的老视频，可以填 3650（约 10 年）</div>
                             </div>
                         </div>
                         <div class="col-md-4" id="max_results_group">
@@ -158,7 +158,14 @@
                         <label for="keywords" class="form-label">包含关键词 <span class="text-danger">*</span></label>
                         <input type="text" class="form-control" id="keywords" name="keywords" 
                                value="{{ config.keywords if config else '' }}" placeholder="多个关键词用空格分隔">
-                        <div class="form-text">视频标题或描述中必须包含的关键词（全YouTube检索时必填）</div>
+                        <div class="form-text">视频标题或描述中必须包含的关键词（全YouTube检索时必填；填了下面的「分组搜索」可以不填）</div>
+                    </div>
+
+                    <div class="mb-3" id="search_queries_group">
+                        <label for="search_queries" class="form-label">分组搜索（可选）</label>
+                        <textarea class="form-control" id="search_queries" name="search_queries" rows="4"
+                                  placeholder="每行一组搜索词，例如：&#10;root canal treatment explained&#10;dental implant procedure">{{ config.search_queries if config and config.search_queries else '' }}</textarea>
+                        <div class="form-text">每行单独搜一次 YouTube，每组最多取「最大结果数」的 2 倍，合并去重后再按下面的条件筛选。填了这里，上面的「包含关键词」就不再用于搜索。每行占 1 次搜索配额（所有监控每天共 95 次），最多 10 行。</div>
                     </div>
 
                     <div class="mb-3">
@@ -676,6 +683,26 @@ function initializeFormState() {
         }
     }
 }
+// 填了「分组搜索」时「包含关键词」不再必填（分组搜索只用于全 YouTube 检索）
+function syncKeywordsRequired() {
+    const keywordsField = document.getElementById('keywords');
+    const youtubeRadio = document.getElementById('monitor_type_youtube');
+    const queries = document.getElementById('search_queries');
+    if (!keywordsField || !youtubeRadio) return;
+    const hasQueries = !!(queries && queries.value.trim() !== '');
+    keywordsField.required = youtubeRadio.checked && !hasQueries;
+}
+(function () {
+    function bindSearchQueries() {
+        const queries = document.getElementById('search_queries');
+        if (queries) queries.addEventListener('input', syncKeywordsRequired);
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindSearchQueries);
+    } else {
+        bindSearchQueries();
+    }
+})();
 function toggleMonitorType() {
     const youtubeRadio = document.getElementById('monitor_type_youtube');
     const channelRadio = document.getElementById('monitor_type_channel');
@@ -687,7 +714,7 @@ function toggleMonitorType() {
     if (youtubeRadio.checked) {
         youtubeSettings.classList.remove('d-none');
         channelSettings.classList.add('d-none');
-        keywordsField.required = true;
+        syncKeywordsRequired();
         // YouTube检索模式显示最大结果数
         if (maxResultsGroup) {
             maxResultsGroup.classList.remove('d-none');
@@ -748,7 +775,7 @@ function showAllYouTubeSearchSettings() {
     // 显示所有YouTube检索设置项
     const elements = [
         'region_code', 'category_id', 'time_period', 'order_by', 
-        'keywords', 'exclude_keywords', 'exclude_channel_ids'
+        'keywords', 'search_queries', 'exclude_keywords', 'exclude_channel_ids'
     ];
     
     elements.forEach(id => {
@@ -798,6 +825,11 @@ function adaptYouTubeSearchForChannel() {
     const excludeChannelContainer = document.getElementById('exclude_channel_ids').closest('.mb-3');
     if (excludeChannelContainer) {
         excludeChannelContainer.classList.add('d-none');
+    }
+    // 分组搜索只用于全 YouTube 检索，频道监控不用
+    const searchQueriesGroup = document.getElementById('search_queries_group');
+    if (searchQueriesGroup) {
+        searchQueriesGroup.classList.add('d-none');
     }
     
     // 设置频道监控模式下的默认排序方式为上传日期

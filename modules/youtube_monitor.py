@@ -65,6 +65,42 @@ def normalize_schedule_time(value: Any) -> str:
     return f"{parsed[0]:02d}:{parsed[1]:02d}" if parsed else ''
 
 
+# 分组搜索：每行一组搜索词，每组单独调用一次 search.list（各占 1 次每日搜索配额）
+MAX_SEARCH_QUERY_GROUPS = 10
+_SEARCH_QUERY_MAX_LENGTH = 200
+
+
+def parse_search_queries(value: Any) -> List[str]:
+    """把「分组搜索」文本拆成搜索词列表：按行拆分，去空行、去重（不分大小写），最多 10 组。"""
+    queries: List[str] = []
+    seen = set()
+    for line in str(value or '').splitlines():
+        query = re.sub(r'\s+', ' ', line).strip()[:_SEARCH_QUERY_MAX_LENGTH].strip()
+        if not query or query.lower() in seen:
+            continue
+        seen.add(query.lower())
+        queries.append(query)
+        if len(queries) >= MAX_SEARCH_QUERY_GROUPS:
+            break
+    return queries
+
+
+def normalize_search_queries(value: Any) -> str:
+    return '\n'.join(parse_search_queries(value))
+
+
+def _interleave_unique(groups: List[List[str]]) -> List[str]:
+    """轮流从每组取一个，去重后合并，避免排在前面的一组占满后面的名额。"""
+    merged: List[str] = []
+    seen = set()
+    for index in range(max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if index < len(group) and group[index] not in seen:
+                seen.add(group[index])
+                merged.append(group[index])
+    return merged
+
+
 def schedule_anchor(hour: int, minute: int, now: Optional[datetime] = None) -> datetime:
     """间隔调度的起点：今天的 HH:MM。之后每隔 interval 触发一次，与何时保存或重启无关。"""
     current = now or datetime.now()
@@ -203,11 +239,14 @@ MONITOR_CONFIG_FIELD_DEFAULTS: Dict[str, Any] = {
     'ai_filter_min_score': 6,
     # 自动调度的对齐时刻 HH:MM（服务器本地时区）；留空则从保存/启动时刻起算间隔
     'schedule_time': '',
+    # 分组搜索：每行一组，每组单独搜一次；填了就不再用 keywords 拼成的 OR 搜索
+    'search_queries': '',
 }
 
-# 更新配置时调用方漏传这些字段就沿用旧值，避免静默关掉 AI 选题或清空对齐时刻
+# 更新配置时调用方漏传这些字段就沿用旧值，避免静默关掉 AI 选题、清空对齐时刻或分组搜索
 _MONITOR_FIELDS_KEPT_WHEN_OMITTED = (
     'ai_filter_enabled', 'ai_filter_criteria', 'ai_filter_min_score', 'schedule_time',
+    'search_queries',
 )
 
 MONITOR_CONFIG_DB_FIELDS: Tuple[str, ...] = tuple(MONITOR_CONFIG_FIELD_DEFAULTS.keys())
@@ -356,6 +395,7 @@ class YouTubeMonitor:
                 "ai_filter_criteria TEXT DEFAULT ''",
                 "ai_filter_min_score INTEGER DEFAULT 6",
                 "schedule_time TEXT DEFAULT ''",
+                "search_queries TEXT DEFAULT ''",
             ):
                 try:
                     cursor.execute(f"ALTER TABLE monitor_configs ADD COLUMN {column_sql}")
@@ -1125,8 +1165,10 @@ class YouTubeMonitor:
             run_stats['filtered_count'] = len(filtered_videos)
             logger.info(f"筛选后剩余 {len(filtered_videos)} 个视频")
 
-            # 历史搬运模式需要考虑偏移量
-            if config.get('channel_mode') == 'historical':
+            # 历史搬运模式需要考虑偏移量。开了 AI 选题时不按偏移量跳过：入队的是按分数挑出来的，
+            # 不是列表最前面的几个，按入队数跳过会把没轮到的达标候选永久跳掉；去重交给监控历史。
+            if (config.get('channel_mode') == 'historical'
+                    and not _as_bool(config.get('ai_filter_enabled'))):
                 current_offset = config.get('historical_offset', 0)
                 if current_offset > 0:
                     logger.info(f"历史搬运模式，跳过前 {current_offset} 个视频")
@@ -1246,6 +1288,12 @@ class YouTubeMonitor:
         finally:
             self._release_monitor_run(config_id, run_claim_token)
 
+    @staticmethod
+    def _curation_keywords(config: Dict[str, Any]) -> str:
+        """交给 AI 选题的「搜索词」上下文：用了分组搜索就是那几组搜索词，否则是 keywords。"""
+        queries = parse_search_queries(config.get('search_queries'))
+        return '；'.join(queries) if queries else str(config.get('keywords') or '')
+
     def _apply_ai_curation(
         self,
         config: Dict[str, Any],
@@ -1255,41 +1303,52 @@ class YouTubeMonitor:
         """给本轮的新候选打分，返回（达到门槛、按分数排好序的候选，统计信息）。
 
         已处理过的候选先去掉，不浪费模型调用；打过分的直接用缓存。失败时抛 AICurationError。
+        每轮最多给 AI_CURATION_MAX_CANDIDATES 个没打过分的候选打分；打过分且没达标的不占名额，
+        否则候选池大时（分组搜索、频道历史搬运），前面的名额会被淘汰过的视频永远占满，之后每轮都是 0。
         """
         fresh = [video for video in candidates if not self._is_video_processed(video['id'], config_id)]
-        batch = fresh[:AI_CURATION_MAX_CANDIDATES]
         criteria = effective_criteria(config.get('ai_filter_criteria'))
         min_score = normalize_min_score(config.get('ai_filter_min_score'))
-        keywords = str(config.get('keywords') or '')
+        keywords = self._curation_keywords(config)
         app_config = load_config() or {}
         fingerprint = verdict_fingerprint(criteria, keywords, app_config.get('OPENAI_MODEL_NAME', ''))
 
-        verdicts = self._load_ai_verdicts(config_id, fingerprint, [video['id'] for video in batch])
-        to_score = [video for video in batch if video['id'] not in verdicts]
+        cached = self._load_ai_verdicts(config_id, fingerprint, [video['id'] for video in fresh])
+        uncached = [video for video in fresh if video['id'] not in cached]
+        to_score = uncached[:AI_CURATION_MAX_CANDIDATES]
+        verdicts = dict(cached)
+        new_verdicts: Dict[str, Tuple[int, str]] = {}
         if to_score:
-            logger.info(f"AI 选题：给 {len(to_score)} 个新候选打分（另有 {len(batch) - len(to_score)} 个用缓存）")
+            logger.info(f"AI 选题：给 {len(to_score)} 个新候选打分（另有 {len(cached)} 个用缓存）")
             new_verdicts = score_videos(to_score, criteria, keywords, app_config, logger=logger)
             self._save_ai_verdicts(config_id, fingerprint, new_verdicts)
             verdicts.update(new_verdicts)
 
+        scoring_now = {video['id'] for video in to_score}
+        batch = [video for video in fresh if video['id'] in cached or video['id'] in scoring_now]
         kept, rejected, unscored = rank_by_verdicts(batch, verdicts, min_score)
+        newly_rejected = [video for video in rejected if video['id'] in new_verdicts]
         for video in kept:
             logger.info(f"AI 选题保留（{video['ai_score']} 分）：{video['title'][:80]} | {video.get('ai_reason', '')}")
-        for video in rejected:
+        for video in newly_rejected:
             logger.info(
                 f"AI 选题淘汰（{video['ai_score']} 分 < {min_score}）：{video['title'][:80]} | {video.get('ai_reason', '')}"
             )
+        if len(rejected) > len(newly_rejected):
+            logger.info(f"AI 选题：另有 {len(rejected) - len(newly_rejected)} 个候选以前打过分、没达标，直接跳过")
         if unscored:
             logger.warning(f"AI 选题：模型漏评 {len(unscored)} 个候选，本轮跳过，下次运行重新打分")
-        if len(fresh) > len(batch):
-            logger.info(f"AI 选题：本轮只评前 {len(batch)} 个新候选，其余 {len(fresh) - len(batch)} 个留到下次")
+        if len(uncached) > len(to_score):
+            logger.info(f"AI 选题：本轮只给 {len(to_score)} 个候选打分，其余 {len(uncached) - len(to_score)} 个留到下次")
 
-        rejected_sorted = sorted(rejected, key=lambda video: -int(video.get('ai_score') or 0))
+        rejected_sorted = sorted(newly_rejected, key=lambda video: -int(video.get('ai_score') or 0))
         summary = {
             'ai_candidates': len(batch),
             'ai_kept': len(kept),
             'ai_rejected': len(rejected),
             'ai_unscored': len(unscored),
+            'ai_new_scored': len(to_score),
+            'ai_deferred': len(uncached) - len(to_score),
             'ai_min_score': min_score,
             'ai_rejected_samples': [
                 {
@@ -1320,8 +1379,9 @@ class YouTubeMonitor:
                     verdicts[video_id] = (int(score), reason or '')
         return verdicts
 
-    # 评分缓存保留天数：搜索窗口一般不超过 30 天，更早的候选不会再出现
-    _AI_VERDICT_RETENTION_DAYS = 60
+    # 评分缓存保留天数。分组搜索不限时间、频道历史搬运时，同一批老视频会长期反复出现，
+    # 缓存留久一些，免得过期后又重新打分。
+    _AI_VERDICT_RETENTION_DAYS = 365
 
     def _save_ai_verdicts(self, config_id, fingerprint, verdicts: Dict[str, Tuple[int, str]]) -> None:
         if not verdicts:
@@ -1505,6 +1565,19 @@ class YouTubeMonitor:
         if config['category_id'] and config['category_id'] != '0':
             search_params['videoCategoryId'] = config['category_id']
 
+        total_budget = max(min(config['max_results'] * 2, 50), 10)
+        grouped_queries = parse_search_queries(config.get('search_queries'))
+        if grouped_queries:
+            video_ids = self._search_query_groups(config, search_params, grouped_queries, total_budget)
+        else:
+            video_ids = self._search_keywords_once(config, search_params, total_budget)
+        if not video_ids:
+            return []
+        return self._fetch_video_details(video_ids)
+
+    def _search_keywords_once(self, config: Dict[str, Any], search_params: Dict[str, Any],
+                              total_budget: int) -> List[str]:
+        """把 keywords 合并成一次 OR 搜索，返回去重后的视频 ID（最多 total_budget 个）。"""
         # 添加关键词搜索：YouTube q 参数原生支持使用“|”进行 OR 搜索。
         # 把多个关键词合并到一次 search.list，避免关键词数量线性消耗搜索配额。
         raw_kw = (config.get('keywords') or '').strip()
@@ -1520,6 +1593,46 @@ class YouTubeMonitor:
             logger.warning("今日 search 配额已耗尽（当日熔断），跳过本轮搜索（将于次日太平洋时间重置）")
             return []
 
+        search_response = self._run_search_request(config, search_params)
+        if search_response is None:
+            return []
+        # 候选数量下限保护：max_results 过小时（如 1）会让候选过少，
+        # 在 monitor_history 已饱和时去重后恒为 0 新视频。
+        video_ids = self._search_response_ids(search_response)[:total_budget]
+        logger.info(f"搜索得到候选 {len(video_ids)} 个（预算 {total_budget}）")
+        return video_ids
+
+    def _search_query_groups(self, config: Dict[str, Any], search_params: Dict[str, Any],
+                             queries: List[str], per_query_budget: int) -> List[str]:
+        """分组搜索：每组单独搜一次，各取最多 per_query_budget 个，轮流合并去重。
+
+        某一组失败只记为本轮不完整，其余组照常搜；配额用完就停，剩下的组下次再搜。
+        """
+        logger.info(f"分组搜索，共 {len(queries)} 组: {queries}")
+        groups: List[List[str]] = []
+        for index, query in enumerate(queries):
+            if self._quota_budget_remaining() <= 0:
+                self._last_fetch_quota_skipped = True
+                logger.warning(
+                    f"今日 search 配额已耗尽（当日熔断），分组搜索在第 {index + 1}/{len(queries)} 组停下"
+                    "（将于次日太平洋时间重置）"
+                )
+                break
+            params = dict(search_params, q=query)
+            response = self._run_search_request(config, params)
+            if response is None:
+                if getattr(self, '_last_fetch_quota_skipped', False):
+                    break
+                continue
+            ids = self._search_response_ids(response)[:per_query_budget]
+            logger.info(f"分组搜索「{query}」得到 {len(ids)} 个候选")
+            groups.append(ids)
+        video_ids = _interleave_unique(groups)
+        logger.info(f"分组搜索合并去重后共 {len(video_ids)} 个候选")
+        return video_ids
+
+    def _run_search_request(self, config: Dict[str, Any], search_params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """执行一次 search.list（扣搜索配额）；失败时记下本轮不完整或配额跳过，返回 None。"""
         try:
             logger.debug(f"准备执行搜索请求，参数: {search_params}")
             search_request = self.youtube.search().list(**search_params)
@@ -1535,52 +1648,46 @@ class YouTubeMonitor:
                 f"配置 {config.get('name', config.get('id', 'unknown'))} 当日 search 配额预算已耗尽，"
                 "跳过本轮（将于次日太平洋时间重置）"
             )
-            return []
+            return None
         except Exception as e:
             logger.error(f"关键词搜索失败: q={search_params.get('q') or '无'}, 错误: {e}")
             self._last_fetch_had_errors = True
-            return []
+            return None
 
         if not search_response or 'items' not in search_response:
             logger.error(f"搜索响应异常: {search_response}")
             self._last_fetch_had_errors = True
-            return []
+            return None
+        return search_response
 
-        # 候选数量下限保护：max_results 过小时（如 1）会让候选过少，
-        # 在 monitor_history 已饱和时去重后恒为 0 新视频。
-        total_budget = max(min(config['max_results'] * 2, 50), 10)
-        video_ids = list(dict.fromkeys(
+    @staticmethod
+    def _search_response_ids(search_response: Dict[str, Any]) -> List[str]:
+        return list(dict.fromkeys(
             item['id']['videoId']
             for item in search_response['items']
             if 'id' in item and 'videoId' in item['id']
-        ))[:total_budget]
-        logger.info(f"搜索得到候选 {len(video_ids)} 个（预算 {total_budget}）")
-        
-        if not video_ids:
-            return []
-        
-        # 获取视频详细信息（带重试）
-        logger.debug(f"准备执行视频详情请求，YouTube API 对象: {type(self.youtube)}")
-        videos_request = self.youtube.videos().list(
-            part='id,snippet,statistics,contentDetails,liveStreamingDetails',
-            id=','.join(video_ids)
-        )
-        logger.debug(f"视频详情请求已创建: {type(videos_request)}")
-        videos_response = self._execute_with_retry(videos_request, 'videos.list')
-        
-        # 添加调试日志 - 检查视频响应
-        logger.debug(f"视频响应类型: {type(videos_response)}, 值: {videos_response}")
-        if videos_response is None:
-            logger.error("视频响应为 None")
-            self._last_fetch_had_errors = True
-            return []
-        
-        if 'items' not in videos_response:
-            logger.error(f"视频响应中缺少 'items' 字段，响应内容: {videos_response}")
-            self._last_fetch_had_errors = True
-            return []
-        
-        return videos_response['items']
+        ))
+
+    def _fetch_video_details(self, video_ids: List[str]) -> List[Dict[str, Any]]:
+        """按 50 个一批取视频详情（videos.list 单次上限 50）；某批失败记为本轮不完整。"""
+        videos: List[Dict[str, Any]] = []
+        for start in range(0, len(video_ids), 50):
+            chunk = video_ids[start:start + 50]
+            videos_request = self.youtube.videos().list(
+                part='id,snippet,statistics,contentDetails,liveStreamingDetails',
+                id=','.join(chunk)
+            )
+            videos_response = self._execute_with_retry(videos_request, 'videos.list')
+            if videos_response is None:
+                logger.error("视频响应为 None")
+                self._last_fetch_had_errors = True
+                continue
+            if 'items' not in videos_response:
+                logger.error(f"视频响应中缺少 'items' 字段，响应内容: {videos_response}")
+                self._last_fetch_had_errors = True
+                continue
+            videos.extend(videos_response['items'])
+        return videos
     
     def _fetch_channel_videos(self, config: Dict[str, Any], published_after: str, published_before: Optional[str] = None) -> List[Dict[str, Any]]:
         """从指定频道获取视频"""
