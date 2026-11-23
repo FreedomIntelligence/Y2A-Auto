@@ -198,6 +198,9 @@ DEFAULT_CONFIG = {
     "BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES": 30,
     # 期望的 bilibili 账号 UID（可选）。填写后，登录账号与之不一致时拒绝上传，避免投错号。
     "BILIBILI_EXPECTED_UID": "",
+    # 投稿封面优化：竖屏缩略图放大后放左侧、背景虚化，右侧加从标题提炼的中文大字；横屏铺满加大字。
+    # 只改投稿用的副本 cover_bili.jpg，手动上传的封面不处理。
+    "BILIBILI_COVER_ENHANCE_ENABLED": False,
     # 上传失败自动重试：只针对 B 站限流（137022）与网络类错误，按指数退避延后重试
     "UPLOAD_AUTO_RETRY_ENABLED": True,
     "UPLOAD_AUTO_RETRY_MAX_ATTEMPTS": 3,

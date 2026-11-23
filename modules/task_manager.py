@@ -3612,6 +3612,22 @@ class TaskProcessor:
             task_logger.error(f"视频文件下载失败: {result}")
             update_task(task_id, status=TASK_STATES['FAILED'], error_message=f"下载视频失败: {result}")
 
+    def _bilibili_upload_cover(self, cover_path, title, task_logger):
+        """开了封面优化就生成投稿用的 cover_bili.jpg；没开、手动上传的封面或生成失败时用原封面。"""
+        if not _as_bool(self.config.get('BILIBILI_COVER_ENHANCE_ENABLED', False)):
+            return cover_path
+        if not cover_path or not os.path.isfile(cover_path):
+            return cover_path
+        if os.path.basename(cover_path).startswith(('custom_cover.', 'cover_bili.')):
+            return cover_path
+        from .cover_enhancer import enhance_cover
+        enhanced = enhance_cover(cover_path, os.path.join(os.path.dirname(cover_path), 'cover_bili.jpg'), title)
+        if enhanced:
+            task_logger.info("已生成优化后的投稿封面 cover_bili.jpg")
+            return enhanced
+        task_logger.warning("封面优化失败，使用原封面")
+        return cover_path
+
     def _recover_cover_path(self, task_id, cover_path, task_logger):
         """尝试恢复缺失的封面文件路径。
 
@@ -10191,6 +10207,7 @@ class TaskProcessor:
                 )
             return
         update_task(task_id, upload_progress='0.0%', silent=True)
+        cover_path = self._bilibili_upload_cover(cover_path, title, task_logger)
 
         upload_attempted = False
         try:

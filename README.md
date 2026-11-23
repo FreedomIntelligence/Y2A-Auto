@@ -12,7 +12,7 @@
 
 从下载、ASR、字幕翻译、字幕质检、内容审核到上传，全流程自动化；内置 Web 管理后台、YouTube 监控和维护能力。
 
-> **FreedomIntelligence 分支**：fork 自 [fqscfqj/Y2A-Auto](https://github.com/fqscfqj/Y2A-Auto)，在无人值守向 bilibili 搬运的场景下补了几处：多语种标题翻译、只有导流内容的简介留空、监控跳过纯话题标签标题、投稿最小间隔、限流与网络失败自动重试、投稿账号校验；监控排除直播时不再给搜索加 `eventType=completed`（它只返回直播回放，会让整轮搜不到视频）；监控可开 AI 选题（按选题标准给候选打分，挡掉广告和借用关键词的视频，按分数排序入队）、按多组搜索词分别搜索、设置对齐时刻（保存设置或重启不再挪动每天的运行时间），每轮运行后可推送摘要或异常提醒。相关配置见[账号与网络](#账号与网络)、[AI 与投稿](#ai-与投稿)和 [YouTube 监控](#youtube-监控)。
+> **FreedomIntelligence 分支**：fork 自 [fqscfqj/Y2A-Auto](https://github.com/fqscfqj/Y2A-Auto)，在无人值守向 bilibili 搬运的场景下补了几处：多语种标题翻译、只有导流内容的简介留空、监控跳过纯话题标签标题、投稿最小间隔、限流与网络失败自动重试、投稿账号校验；监控排除直播时不再给搜索加 `eventType=completed`（它只返回直播回放，会让整轮搜不到视频）；监控可开 AI 选题（按选题标准给候选打分，挡掉广告和借用关键词的视频，按分数排序入队）、按多组搜索词分别搜索、设置对齐时刻（保存设置或重启不再挪动每天的运行时间），每轮运行后可推送摘要或异常提醒；可选的投稿封面优化（竖屏画面放大、加中文大字）。相关配置见[账号与网络](#账号与网络)、[AI 与投稿](#ai-与投稿)和 [YouTube 监控](#youtube-监控)。
 
 [快速开始](#快速开始) · [功能概览](#功能概览) · [部署与运行](#部署与运行) · [Telegram 机器人](#方案-dtelegram-转发机器人可选) · [配置说明](#配置说明) · [使用指南](#使用指南) · [通知推送](#通知推送) · [CookieCloud](#cookiecloud-集成) · [安全特性](#安全特性) · [常见问题](#常见问题)
 
@@ -249,6 +249,7 @@ python app.py
 - `BILIBILI_SUBMIT_API`：bilibili 投稿接口，`auto`（默认，优先必剪 PC 接口，失败回退 Web）/ `bcut_pc` / `web`（手改成 `bcut` 等别名也会被归一化后再保存）
 - `BILIBILI_MIN_UPLOAD_INTERVAL_MINUTES`：两次 bilibili 投稿之间的最小间隔（分钟），默认 `30`，`0` 不限制。同一账号几分钟内连续投稿会被 B 站以 137022「投稿过于频繁」拒绝；不足间隔时上传前自动等待，任务进度显示「等待B站投稿间隔」
 - `BILIBILI_EXPECTED_UID`：期望的 bilibili 账号 UID（个人空间地址 `space.bilibili.com/` 后面的数字），默认留空不校验。填写后每次上传前核对 Cookie 里登录的账号，扫码登成别的账号时拒绝上传
+- `BILIBILI_COVER_ENHANCE_ENABLED`：优化 bilibili 投稿封面，默认关闭。竖屏视频的缩略图在 B站会缩成中间一条；开启后竖屏画面按 3:4 放大放在左侧、背景用同一画面虚化压暗，右侧加从标题提炼的中文大字（标题第一句不超过 6 个字就用它，否则用标题里最具体的牙科术语，如「根管治疗」「洗牙」，都没有就不加字）；横屏画面铺满，左下角加大字。YouTube 给 Shorts 生成的「中间竖条、两边模糊」的横版缩略图也按竖屏处理。只生成投稿用的副本 `cover_bili.jpg`，手动上传的封面不处理，生成失败时用原封面
 - `YOUTUBE_PROXY_ENABLED` / `YOUTUBE_PROXY_URL`：YouTube 下载代理
 - `YOUTUBE_API_PROXY_ENABLED` / `YOUTUBE_API_PROXY_URL`：YouTube 监控 API 独立代理，不继承下载代理
 - `YOUTUBE_DOWNLOAD_THREADS`：下载线程数
