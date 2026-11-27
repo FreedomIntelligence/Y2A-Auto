@@ -1949,6 +1949,29 @@ def get_db_connection():
         logger.debug(f"设置SQLite连接参数失败，将使用默认参数: {e}")
     return conn
 
+_YOUTUBE_ID_IN_URL_RE = re.compile(r'(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})')
+
+
+def existing_youtube_video_ids(video_ids):
+    """任务表里已经有任务的 YouTube 视频 ID（任何状态、任何来源，含手动添加）。
+
+    监控各自按监控历史去重，多个监控搜到同一个视频时，靠这一步避免重复建任务、重复投稿。
+    任务库还不存在时返回空集合，不会创建库文件。
+    """
+    wanted = {str(v) for v in (video_ids or ()) if v}
+    if not wanted or not os.path.exists(DB_PATH):
+        return set()
+    conn = get_db_connection()
+    try:
+        rows = conn.execute('SELECT youtube_url FROM tasks').fetchall()
+    finally:
+        conn.close()
+    found = set()
+    for row in rows:
+        found.update(vid for vid in _YOUTUBE_ID_IN_URL_RE.findall(row['youtube_url'] or '') if vid in wanted)
+    return found
+
+
 def add_task(youtube_url, upload_target=None):
     """
     添加新任务到数据库

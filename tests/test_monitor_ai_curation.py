@@ -190,6 +190,8 @@ class _MonitorTestBase(unittest.TestCase):
             patch("modules.youtube_monitor.get_app_subdir", side_effect=self._get_app_subdir),
             patch.object(YouTubeMonitor, "_init_youtube_api", return_value=(False, "missing")),
             patch("modules.youtube_monitor.load_config", side_effect=lambda: dict(self.app_config)),
+            # 跨监控去重会查任务表：指向临时目录，不碰仓库里的 db/tasks.db
+            patch("modules.task_manager.DB_PATH", os.path.join(self.tmpdir, "tasks.db")),
         ]
         self.app_config = dict(APP_CONFIG)
         for p in self.patchers:

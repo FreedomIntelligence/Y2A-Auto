@@ -20,7 +20,7 @@ import uuid
 from urllib.parse import quote, urlsplit
 from apscheduler.schedulers.background import BackgroundScheduler
 from logging.handlers import RotatingFileHandler
-from modules.task_manager import add_task
+from modules.task_manager import add_task, existing_youtube_video_ids
 from .ai_enhancer import has_enough_title_text
 from .config_manager import load_config
 from .monitor_curation import (
@@ -1174,6 +1174,14 @@ class YouTubeMonitor:
                     logger.info(f"历史搬运模式，跳过前 {current_offset} 个视频")
                     filtered_videos = filtered_videos[current_offset:]
                     logger.info(f"应用偏移量后剩余 {len(filtered_videos)} 个视频")
+
+            # 跨监控去重：别的监控已经加进任务、或任务表里已有的视频（含手动添加）直接跳过，
+            # 不打分、不入队，避免同一个视频投稿两次
+            reposted = self._videos_already_reposted([video['id'] for video in filtered_videos], config_id)
+            if reposted:
+                filtered_videos = [video for video in filtered_videos if video['id'] not in reposted]
+                run_stats['skipped_reposted'] = len(reposted)
+                logger.info(f"跳过 {len(reposted)} 个已由其他监控或手动加入过任务的视频")
 
             # AI 选题：只把达到门槛的新候选按分数从高到低交给下面的入队循环
             ai_note = ''
@@ -2347,6 +2355,34 @@ class YouTubeMonitor:
                 and (row[1] is None or row[1] < time.time() - 600)
             )
     
+    def _videos_already_reposted(self, video_ids, config_id):
+        """别的监控已经加进任务（或正在加）的视频，加上任务表里已有任务的视频。
+
+        监控历史按监控各自记录，只靠它去重时，两个监控搜到同一个视频会各建一个任务。
+        查询失败时记日志、按没有重复处理，不影响本轮运行。
+        """
+        ids = [str(v) for v in video_ids if v]
+        if not ids:
+            return set()
+        found = set()
+        try:
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start:start + 500]
+                    marks = ','.join('?' * len(chunk))
+                    found.update(row[0] for row in conn.execute(
+                        'SELECT DISTINCT video_id FROM monitor_history '
+                        f'WHERE config_id != ? AND added_to_tasks IN (1, 2) AND video_id IN ({marks})',
+                        (config_id, *chunk),
+                    ))
+        except Exception as exc:
+            logger.warning(f"查询其他监控的历史失败，本轮不做跨监控去重: {exc}")
+        try:
+            found.update(existing_youtube_video_ids(ids))
+        except Exception as exc:
+            logger.warning(f"查询任务表失败，本轮不按任务表去重: {exc}")
+        return found
+
     def _save_video_history(self, video_info, config_id, auto_add_to_tasks=False):
         """保存视频到历史记录，并在任务创建成功后才标记 added_to_tasks。"""
         self._last_history_task_added = False
