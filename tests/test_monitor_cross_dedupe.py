@@ -48,6 +48,17 @@ class CrossMonitorDedupeTests(_MonitorTestBase):
         self.assertEqual(self._run(first, [_raw_video(A)]), [A])
         self.assertEqual(self._run(second, [_raw_video(A), _raw_video(B)]), [B])
 
+    def test_own_earlier_tasks_are_not_reported_as_reposted_elsewhere(self):
+        config_id = self._create_config(ai_filter_enabled=False, rate_limit_requests=5)
+        self.assertEqual(self._run(config_id, [_raw_video(A)]), [A])
+        self._insert_task(f"https://www.youtube.com/watch?v={A}")  # 本监控自己加的任务
+        self._insert_task(f"https://youtu.be/{B}")  # 手动加的任务
+        with self.assertLogs("Y2A-Auto.YouTube-Monitor", level="INFO") as logs:
+            self.assertEqual(self._run(config_id, [_raw_video(A), _raw_video(B), _raw_video(C)]), [C])
+        skipped = [line for line in logs.output if "已由其他监控或手动加入过任务" in line]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("跳过 1 个", skipped[0])
+
     def test_video_only_seen_by_another_monitor_can_still_be_added(self):
         first = self._create_config(name="m1", ai_filter_enabled=False, auto_add_to_tasks=False)
         second = self._create_config(name="m2", ai_filter_enabled=False, rate_limit_requests=5)

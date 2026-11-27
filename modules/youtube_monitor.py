@@ -1180,8 +1180,11 @@ class YouTubeMonitor:
             reposted = self._videos_already_reposted([video['id'] for video in filtered_videos], config_id)
             if reposted:
                 filtered_videos = [video for video in filtered_videos if video['id'] not in reposted]
-                run_stats['skipped_reposted'] = len(reposted)
-                logger.info(f"跳过 {len(reposted)} 个已由其他监控或手动加入过任务的视频")
+                # 本监控以前加过的视频也在任务表里，照旧算「已处理」，不计入这条提示
+                elsewhere = [vid for vid in reposted if not self._is_video_processed(vid, config_id)]
+                if elsewhere:
+                    run_stats['skipped_reposted'] = len(elsewhere)
+                    logger.info(f"跳过 {len(elsewhere)} 个已由其他监控或手动加入过任务的视频")
 
             # AI 选题：只把达到门槛的新候选按分数从高到低交给下面的入队循环
             ai_note = ''
