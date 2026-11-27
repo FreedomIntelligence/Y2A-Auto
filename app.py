@@ -91,8 +91,17 @@ def _origin_is_same_site(origin: str | None) -> bool:
         return False
     try:
         parsed = urlparse(origin)
-        request_host = (request.host_url or '').rstrip('/')
-        return bool(parsed.scheme and parsed.netloc and f'{parsed.scheme}://{parsed.netloc}'.rstrip('/') == request_host)
+        if not (parsed.scheme and parsed.netloc):
+            return False
+        candidate = f'{parsed.scheme}://{parsed.netloc}'.rstrip('/').lower()
+        if candidate == (request.host_url or '').rstrip('/').lower():
+            return True
+        # 反向代理终止 HTTPS 后用 http 转给本程序时，程序看到的是 http://域名，浏览器的 Origin 是 https://域名。
+        # 这时只认代理传来的 X-Forwarded-Proto 里的协议，域名仍必须和请求的 Host 一致；CSRF token 照常校验。
+        forwarded_proto = (request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+        if forwarded_proto in ('http', 'https'):
+            return candidate == f'{forwarded_proto}://{request.host}'.rstrip('/').lower()
+        return False
     except Exception:
         return False
 
