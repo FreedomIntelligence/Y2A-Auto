@@ -173,6 +173,11 @@ with open(
     LINES_INFO = json.loads(f.read())
 
 
+# 分块上传时单次请求的超时（秒）。SDK 默认的 30 秒是给普通接口用的：B站 的分块常有 5–10 MB，
+# 还会几块同时传，上行带宽小（例如 5 Mbps）时一块 30 秒传不完，长视频会反复超时，直到上传失败。
+CHUNK_UPLOAD_TIMEOUT_SECONDS = 300.0
+
+
 async def _probe() -> dict:
     """
     测试所有线路
@@ -1160,37 +1165,51 @@ class VideoUploader(AsyncEvent):
         except (TypeError, ValueError):
             threads = 1
 
-        while chunks_pending:
-            tasks = []
+        try:
+            while chunks_pending:
+                tasks = []
 
-            while len(tasks) < threads and chunks_pending:
-                offset, chunk_number = chunks_pending.pop(0)
-                tasks.append(
-                    create_task(
-                        self._upload_chunk(
-                            page,
-                            offset,
-                            chunk_number,
-                            total_chunk_count,
-                            preupload,
+                while len(tasks) < threads and chunks_pending:
+                    offset, chunk_number = chunks_pending.pop(0)
+                    tasks.append(
+                        create_task(
+                            self._upload_chunk(
+                                page,
+                                offset,
+                                chunk_number,
+                                total_chunk_count,
+                                preupload,
+                            )
                         )
                     )
-                )
 
-            try:
-                await asyncio.gather(*tasks)
-            except BaseException:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+                try:
+                    await asyncio.gather(*tasks)
+                except BaseException:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
+        finally:
+            self._restore_chunk_timeout()
 
         data = await self._complete_page(page, total_chunk_count, preupload, upload_id)
 
         self.dispatch(VideoUploaderEvents.AFTER_PAGE.value, {"page": page})
 
         return data
+
+    def _restore_chunk_timeout(self) -> None:
+        """把分块阶段调长的请求超时恢复成全局设置（提交分 P、封面、投稿等普通接口用）。"""
+        session = getattr(self, "_chunk_timeout_session", None)
+        self._chunk_timeout_session = None
+        if session is None:
+            return
+        try:
+            session.set_timeout(request_settings.get_timeout())
+        except Exception:
+            pass
 
     @staticmethod
     def _switch_upload_endpoint(preupload: dict, line: dict = None) -> dict:
@@ -1236,6 +1255,14 @@ class VideoUploader(AsyncEvent):
             "total_chunk_count": total_chunk_count,
         }
         session = get_client()
+        # 分块用更长的超时，分块阶段结束后由 _upload_page 恢复成普通接口的超时
+        try:
+            session.set_timeout(
+                max(CHUNK_UPLOAD_TIMEOUT_SECONDS, float(request_settings.get_timeout() or 0))
+            )
+            self._chunk_timeout_session = session
+        except Exception:
+            pass
 
         stream = open(page.path, "rb")
         stream.seek(offset)

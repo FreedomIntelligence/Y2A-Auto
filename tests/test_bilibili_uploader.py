@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from modules.bili_sdk import video_uploader as video_uploader_module
 from modules.bili_sdk.exceptions.NetworkException import NetworkException
 from modules.bili_sdk.utils.AsyncEvent import AsyncEvent
 from modules.bili_sdk.video_uploader import (
@@ -128,6 +129,52 @@ class BilibiliSdkChunkRetryTests(unittest.TestCase):
         self.assertEqual(client.request.await_count, 1)
         self.assertEqual(len(failures), 1)
         self.assertFalse(failures[0]["retrying"])
+
+    def test_chunk_request_uses_long_timeout(self):
+        client = Mock()
+        timeouts_at_request = []
+
+        async def fake_request(**_kwargs):
+            timeouts_at_request.append(client.set_timeout.call_args.args[0])
+            return _FakeResponse(200)
+
+        client.request = AsyncMock(side_effect=fake_request)
+        with patch("modules.bili_sdk.video_uploader.get_client", return_value=client):
+            asyncio.run(self.uploader._upload_chunk(self.page, 0, 0, 1, dict(self.preupload)))
+
+        self.assertEqual(timeouts_at_request, [video_uploader_module.CHUNK_UPLOAD_TIMEOUT_SECONDS])
+        self.assertGreaterEqual(video_uploader_module.CHUNK_UPLOAD_TIMEOUT_SECONDS, 120)
+
+    def test_upload_page_restores_normal_timeout_after_chunks(self):
+        client = Mock()
+        client.request = AsyncMock(return_value=_FakeResponse(200))
+        self.uploader._preupload = AsyncMock(return_value={**self.preupload, "chunk_size": 4, "threads": 2})
+        self.uploader._complete_page = AsyncMock(return_value={"filename": "video", "cid": 1})
+
+        with patch("modules.bili_sdk.video_uploader.get_client", return_value=client):
+            asyncio.run(self.uploader._upload_page(self.page))
+
+        self.assertEqual(client.request.await_count, 2)
+        self.assertEqual(
+            client.set_timeout.call_args.args[0],
+            video_uploader_module.request_settings.get_timeout(),
+        )
+
+    def test_upload_page_restores_timeout_when_chunks_fail(self):
+        client = Mock()
+        client.request = AsyncMock(return_value=_FakeResponse(403))
+        self.uploader._preupload = AsyncMock(return_value={**self.preupload, "chunk_size": 4, "threads": 1})
+        self.uploader._complete_page = AsyncMock()
+
+        with patch("modules.bili_sdk.video_uploader.get_client", return_value=client):
+            with self.assertRaises(NetworkException):
+                asyncio.run(self.uploader._upload_page(self.page))
+
+        self.uploader._complete_page.assert_not_awaited()
+        self.assertEqual(
+            client.set_timeout.call_args.args[0],
+            video_uploader_module.request_settings.get_timeout(),
+        )
 
     def test_upload_page_uses_one_thread_when_preupload_returns_zero(self):
         preupload = {
